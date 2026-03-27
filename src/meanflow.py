@@ -6,6 +6,7 @@ class MeanFlowLanguageModel(nn.Module):
     def __init__(self, vocab_size, d_model=768, num_heads=12, num_layers=12, max_seq_len=256):
         super().__init__()
         self.d_model = d_model
+        self.max_seq_len = max_seq_len
         
         # 1. The Continuous Bridge (Embedding & Positional Encoding)
         self.embedding = nn.Embedding(vocab_size, d_model)
@@ -37,6 +38,11 @@ class MeanFlowLanguageModel(nn.Module):
         """
         # Embed the time step t
         t_emb = self.time_embed(t).unsqueeze(1) # [batch, 1, d_model]
+
+        if x_t.size(1) > self.max_seq_len:
+            raise ValueError(
+                f"Input seq_len={x_t.size(1)} exceeds max_seq_len={self.max_seq_len}."
+            )
         
         # Add position and time information to the continuous latent state
         x = x_t + self.pos_encoding[:, :x_t.size(1), :] + t_emb
@@ -48,7 +54,7 @@ class MeanFlowLanguageModel(nn.Module):
         pred_x1 = self.output_head(hidden)
         return pred_x1
 
-    def compute_loss(self, input_ids, pad_token_id=50256):
+    def compute_loss(self, input_ids, pad_token_id=None):
         """
         The training objective: teaches the model the Mean Flow trajectory.
         Includes masking to ignore padding tokens.
@@ -72,8 +78,11 @@ class MeanFlowLanguageModel(nn.Module):
         pred_x1 = self.forward_net(x_t, t)
         
         # --- Masking Logic ---
-        # Create a mask for non-padding tokens [batch, seq_len]
-        mask = (input_ids != pad_token_id).float()
+        # If pad_token_id is not provided, train on all tokens.
+        if pad_token_id is None:
+            mask = torch.ones_like(input_ids, dtype=torch.float)
+        else:
+            mask = (input_ids != pad_token_id).float()
         mask_expanded = mask.unsqueeze(-1) # [batch, seq_len, 1]
         
         # Step F: The Mean Flow Continuous Loss (Mean Squared Error)
@@ -83,11 +92,17 @@ class MeanFlowLanguageModel(nn.Module):
         
         # Step G: Auxiliary Classification Loss
         logits = self.lm_head(pred_x1)
-        ce_loss = F.cross_entropy(
-            logits.view(-1, logits.size(-1)), 
-            input_ids.view(-1),
-            ignore_index=pad_token_id
-        )
+        if pad_token_id is None:
+            ce_loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                input_ids.view(-1),
+            )
+        else:
+            ce_loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                input_ids.view(-1),
+                ignore_index=pad_token_id,
+            )
         
         # Combine the losses (Increased CE weight to 0.5 to help early convergence)
         return mse_loss + 0.5 * ce_loss

@@ -49,7 +49,15 @@ To train the model on a sample of the WikiText-2 dataset:
 python src/train.py
 ```
 
+You can override key run settings from the command line, for example:
+
+```bash
+python src/train.py --epochs 20 --batch-size 8 --dataset-split "train[:10%]" --model-path src/meanflow_language_model.pth
+```
+
 The training pipeline uses **Text Grouping**, where all tokenized examples are concatenated and split into equal blocks of `SEQ_LEN`. This removes the bias caused by padding short sentences and ensures the model only learns from real data.
+
+Training now uses a deterministic seed (`SEED=42`) and a train/validation split. The model checkpoint at `src/meanflow_language_model.pth` is updated when validation loss improves.
 
 ### Inference
 
@@ -59,8 +67,24 @@ To generate text using a trained model:
 python src/inference.py
 ```
 
+You can also configure inference without editing code:
+
+```bash
+python src/inference.py --model-path src/meanflow_language_model.pth --seq-len 128 --num-sequences 5 --device auto
+```
+
+### Smoke Test
+
+Run a lightweight end-to-end smoke test (one training batch + one inference pass):
+
+```bash
+python src/smoke_test.py
+```
+
 ## Loss Functions
 
-The model uses a dual-objective loss with **Padding Masking**:
+The model uses a dual-objective loss with optional **Padding Masking**:
 - **Masked MSE Loss**: Minimizes the distance between the predicted $x_1$ and the ground-truth text embeddings, ignoring padding tokens.
 - **Masked CE Loss**: A cross-entropy loss (weighted at `0.5`) that ensures the predicted continuous vectors align perfectly with the discrete vocabulary. This auxiliary loss is critical for "rounding" accuracy.
+
+When using grouped fixed-length blocks (the default training path), there is no padding and the loss is computed over all tokens.
