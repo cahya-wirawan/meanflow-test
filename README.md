@@ -61,6 +61,24 @@ You can override key run settings from the command line, for example:
 python src/train.py --epochs 20 --batch-size 8 --dataset-split "train[:10%]" --model-path src/meanflow_language_model.pth
 ```
 
+Recommended stable training profile:
+
+```bash
+python src/train.py \
+	--learning-rate 5e-5 \
+	--lr-scheduler plateau \
+	--lr-patience 2 \
+	--lr-factor 0.5 \
+	--grad-clip-norm 1.0 \
+	--early-stop-patience 8 \
+	--early-stop-min-delta 1e-4 \
+	--ce-weight-start 0.5 \
+	--ce-weight-end 0.5 \
+	--t-sample-power 1.2 \
+	--wandb \
+	--wandb-log-interval 50
+```
+
 Enable W&B logging during training:
 
 ```bash
@@ -72,6 +90,16 @@ For local/offline logging:
 ```bash
 python src/train.py --wandb --wandb-mode offline
 ```
+
+The training script now also supports:
+- Gradient clipping with `--grad-clip-norm`
+- Validation-driven LR scheduling with `--lr-scheduler plateau`
+- Early stopping with `--early-stop-patience` and `--early-stop-min-delta`
+- Time-bias control with `--t-sample-power` (biases training toward $t \approx 0$)
+- CE weighting schedule with `--ce-weight-start` and `--ce-weight-end`
+- W&B batch metrics via `--wandb-log-interval`
+- Separate MSE/CE logging for train and validation losses
+- Diversity diagnostics in W&B (`distinct_1`, `distinct_2`, entropy)
 
 The training pipeline uses **Text Grouping**, where all tokenized examples are concatenated and split into equal blocks of `SEQ_LEN`. This removes the bias caused by padding short sentences and ensures the model only learns from real data.
 
@@ -91,6 +119,17 @@ You can also configure inference without editing code:
 python src/inference.py --model-path src/meanflow_language_model.pth --seq-len 128 --num-sequences 5 --device auto
 ```
 
+To reduce repetitive outputs, use sampling instead of greedy decoding:
+
+```bash
+python src/inference.py \
+	--model-path src/meanflow_language_model.pth \
+	--sample \
+	--temperature 1.0 \
+	--top-k 50 \
+	--seed 42
+```
+
 ### Smoke Test
 
 Run a lightweight end-to-end smoke test (one training batch + one inference pass):
@@ -98,6 +137,44 @@ Run a lightweight end-to-end smoke test (one training batch + one inference pass
 ```bash
 python src/smoke_test.py
 ```
+
+## Troubleshooting
+
+- Symptom: Generated text is repetitive (for example, "the the the...").
+	- Try: `--sample --temperature 1.0 --top-k 50` in inference.
+	- Try: Increase training diversity pressure with `--ce-weight-end 1.0` (or slightly higher).
+
+- Symptom: Validation loss rises or oscillates late in training.
+	- Try: Lower LR (for example, `--learning-rate 5e-5`).
+	- Try: Enable plateau scheduler (`--lr-scheduler plateau --lr-patience 2 --lr-factor 0.5`).
+	- Try: Enable early stopping (`--early-stop-patience 8`).
+
+- Symptom: Training appears unstable (large jumps in loss).
+	- Try: Enable gradient clipping (`--grad-clip-norm 1.0`).
+	- Try: Use constant CE weighting (`--ce-weight-start 0.5 --ce-weight-end 0.5`) for easier diagnosis.
+
+- Symptom: Generation quality is weak at inference time $t=0$.
+	- Try: Bias training toward smaller $t$ with `--t-sample-power 1.2` to `2.0`.
+
+- Symptom: W&B logging fails with import error.
+	- Try: Install W&B with `pip install wandb`.
+	- For air-gapped runs: use `--wandb --wandb-mode offline`.
+
+- Symptom: Out-of-memory (CUDA/MPS) during training.
+	- Try: Reduce `--batch-size` first.
+	- Try: Reduce `--seq-len` or `--d-model` if memory is still insufficient.
+
+- Symptom: Metrics are hard to interpret.
+	- Use the logged component losses (`train_mse_loss`, `train_ce_loss`, `val_mse_loss`, `val_ce_loss`) instead of only total loss.
+	- Watch diversity diagnostics (`distinct_1`, `distinct_2`, `token_entropy_norm`) to detect collapse early.
+
+## Known Good Baselines
+
+| Profile | Use Case | Command |
+| --- | --- | --- |
+| Fast Debug | Quick sanity check on small data with minimal runtime | `python src/train.py --dataset-split "train[:2%]" --epochs 5 --batch-size 8 --seq-len 64 --lr-scheduler none --early-stop-patience 0` |
+| Stable Training | Main training run with anti-instability defaults | `python src/train.py --dataset-split "train[:20%]" --learning-rate 5e-5 --lr-scheduler plateau --lr-patience 2 --lr-factor 0.5 --grad-clip-norm 1.0 --early-stop-patience 8 --early-stop-min-delta 1e-4 --ce-weight-start 0.5 --ce-weight-end 0.5 --t-sample-power 1.2 --wandb --wandb-log-interval 50` |
+| Diversity-Focused Inference | Reduce repetitive generation loops with stochastic decoding | `python src/inference.py --model-path src/meanflow_language_model.pth --sample --temperature 1.0 --top-k 50 --seed 42 --num-sequences 5` |
 
 ## Loss Functions
 

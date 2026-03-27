@@ -1,5 +1,6 @@
 import torch
 import torch.optim as optim
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from datasets import load_dataset
 import random
@@ -12,7 +13,7 @@ BATCH_SIZE = 16
 EPOCHS = 100
 LEARNING_RATE = 1e-4
 SEED = 42
-DATASET_SPLIT = "train[:5%]"
+DATASET_SPLIT = "train[:20%]"
 VAL_RATIO = 0.1
 MODEL_PATH = "src/meanflow_language_model.pth"
 NUM_PROC = 4
@@ -240,6 +241,60 @@ def parse_args():
             "Set to 0 to disable batch logging; use values like 10 or 50 to reduce log volume."
         ),
     )
+    parser.add_argument(
+        "--grad-clip-norm",
+        type=float,
+        default=1.0,
+        help=(
+            "Max gradient norm for clipping before optimizer step. "
+            "Set to 0 to disable clipping."
+        ),
+    )
+    parser.add_argument(
+        "--lr-scheduler",
+        type=str,
+        choices=["none", "plateau"],
+        default="plateau",
+        help=(
+            "Learning-rate scheduler strategy. "
+            "plateau uses validation loss to reduce LR when progress stalls."
+        ),
+    )
+    parser.add_argument(
+        "--lr-patience",
+        type=int,
+        default=3,
+        help=(
+            "Number of epochs with no validation improvement before LR reduction "
+            "when using the plateau scheduler."
+        ),
+    )
+    parser.add_argument(
+        "--lr-factor",
+        type=float,
+        default=0.5,
+        help=(
+            "Multiplicative LR decay factor for plateau scheduler. "
+            "New LR = old LR * factor."
+        ),
+    )
+    parser.add_argument(
+        "--early-stop-patience",
+        type=int,
+        default=10,
+        help=(
+            "Stop training after this many epochs without meaningful validation improvement. "
+            "Set to 0 to disable early stopping."
+        ),
+    )
+    parser.add_argument(
+        "--early-stop-min-delta",
+        type=float,
+        default=1e-4,
+        help=(
+            "Minimum validation-loss decrease required to count as an improvement for early stopping."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -278,6 +333,16 @@ def validate_args(args):
         raise ValueError("--diagnostic-temperature must be > 0")
     if args.diagnostic_top_k < 0:
         raise ValueError("--diagnostic-top-k must be >= 0")
+    if args.grad_clip_norm < 0:
+        raise ValueError("--grad-clip-norm must be >= 0")
+    if args.lr_patience < 0:
+        raise ValueError("--lr-patience must be >= 0")
+    if not (0.0 < args.lr_factor < 1.0):
+        raise ValueError("--lr-factor must be between 0 and 1 (exclusive)")
+    if args.early_stop_patience < 0:
+        raise ValueError("--early-stop-patience must be >= 0")
+    if args.early_stop_min_delta < 0:
+        raise ValueError("--early-stop-min-delta must be >= 0")
 
 
 def compute_diversity_metrics(tokens, vocab_size):
@@ -305,6 +370,44 @@ def compute_diversity_metrics(tokens, vocab_size):
         "token_entropy": float(entropy),
         "token_entropy_norm": float(norm_entropy),
     }
+
+
+def compute_loss_components(model, input_ids, pad_token_id=None, ce_weight=0.5, t_sample_power=1.0):
+    batch_size, _ = input_ids.shape
+
+    x_1 = model.embedding(input_ids)
+    x_0 = torch.randn_like(x_1)
+
+    t = torch.rand(batch_size, 1, device=x_1.device).pow(t_sample_power)
+    t_expanded = t.unsqueeze(-1)
+    x_t = t_expanded * x_1 + (1 - t_expanded) * x_0
+
+    pred_x1 = model.forward_net(x_t, t)
+
+    if pad_token_id is None:
+        mask = torch.ones_like(input_ids, dtype=torch.float)
+    else:
+        mask = (input_ids != pad_token_id).float()
+    mask_expanded = mask.unsqueeze(-1)
+
+    diff = (pred_x1 - x_1) * mask_expanded
+    mse_loss = (diff**2).sum() / (mask.sum() * model.d_model + 1e-6)
+
+    logits = model.lm_head(pred_x1)
+    if pad_token_id is None:
+        ce_loss = F.cross_entropy(
+            logits.view(-1, logits.size(-1)),
+            input_ids.view(-1),
+        )
+    else:
+        ce_loss = F.cross_entropy(
+            logits.view(-1, logits.size(-1)),
+            input_ids.view(-1),
+            ignore_index=pad_token_id,
+        )
+
+    total_loss = mse_loss + ce_weight * ce_loss
+    return total_loss, mse_loss, ce_loss
 
 def main():
     args = parse_args()
@@ -395,6 +498,14 @@ def main():
         max_seq_len=args.seq_len,
     ).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
+    scheduler = None
+    if args.lr_scheduler == "plateau":
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=args.lr_factor,
+            patience=args.lr_patience,
+        )
 
     if args.wandb:
         wandb_run = wandb.init(
@@ -422,6 +533,12 @@ def main():
                 "diagnostic_samples": args.diagnostic_samples,
                 "diagnostic_temperature": args.diagnostic_temperature,
                 "diagnostic_top_k": args.diagnostic_top_k,
+                "grad_clip_norm": args.grad_clip_norm,
+                "lr_scheduler": args.lr_scheduler,
+                "lr_patience": args.lr_patience,
+                "lr_factor": args.lr_factor,
+                "early_stop_patience": args.early_stop_patience,
+                "early_stop_min_delta": args.early_stop_min_delta,
                 "device": str(device),
                 "train_blocks": len(train_dataset),
                 "val_blocks": len(val_dataset),
@@ -432,11 +549,14 @@ def main():
     print("\nStarting Training...")
     best_val_loss = float("inf")
     global_step = 0
+    epochs_without_improvement = 0
 
     try:
         for epoch in range(args.epochs):
             model.train()
             total_train_loss = 0.0
+            total_train_mse = 0.0
+            total_train_ce = 0.0
             if args.epochs == 1:
                 epoch_progress = 1.0
             else:
@@ -448,16 +568,21 @@ def main():
             for batch in train_dataloader:
                 input_ids = batch["input_ids"].to(device)
                 optimizer.zero_grad()
-                loss = model.compute_loss(
+                loss, mse_loss, ce_loss = compute_loss_components(
+                    model,
                     input_ids,
                     pad_token_id=None,
                     ce_weight=ce_weight,
                     t_sample_power=args.t_sample_power,
                 )
                 loss.backward()
+                if args.grad_clip_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm)
                 optimizer.step()
                 global_step += 1
                 total_train_loss += loss.item()
+                total_train_mse += mse_loss.item()
+                total_train_ce += ce_loss.item()
 
                 if (
                     wandb_run is not None
@@ -467,6 +592,8 @@ def main():
                     wandb_run.log(
                         {
                             "batch_loss": loss.item(),
+                            "batch_mse_loss": mse_loss.item(),
+                            "batch_ce_loss": ce_loss.item(),
                             "epoch": epoch + 1,
                             "global_step": global_step,
                         },
@@ -474,26 +601,43 @@ def main():
                     )
 
             avg_train_loss = total_train_loss / len(train_dataloader)
+            avg_train_mse = total_train_mse / len(train_dataloader)
+            avg_train_ce = total_train_ce / len(train_dataloader)
 
             model.eval()
             total_val_loss = 0.0
+            total_val_mse = 0.0
+            total_val_ce = 0.0
             with torch.no_grad():
                 for batch in val_dataloader:
                     input_ids = batch["input_ids"].to(device)
-                    val_loss = model.compute_loss(
+                    val_loss, val_mse, val_ce = compute_loss_components(
+                        model,
                         input_ids,
                         pad_token_id=None,
                         ce_weight=ce_weight,
                         t_sample_power=args.t_sample_power,
                     )
                     total_val_loss += val_loss.item()
+                    total_val_mse += val_mse.item()
+                    total_val_ce += val_ce.item()
 
             avg_val_loss = total_val_loss / len(val_dataloader)
+            avg_val_mse = total_val_mse / len(val_dataloader)
+            avg_val_ce = total_val_ce / len(val_dataloader)
 
-            improved = avg_val_loss < best_val_loss
+            if scheduler is not None:
+                scheduler.step(avg_val_loss)
+
+            current_lr = optimizer.param_groups[0]["lr"]
+
+            improved = avg_val_loss < (best_val_loss - args.early_stop_min_delta)
             if improved:
                 best_val_loss = avg_val_loss
                 torch.save(model.state_dict(), args.model_path)
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += 1
 
             if wandb_run is not None:
                 diagnostic_tokens = model.generate_1_step(
@@ -509,10 +653,16 @@ def main():
                     {
                         "epoch": epoch + 1,
                         "train_loss": avg_train_loss,
+                        "train_mse_loss": avg_train_mse,
+                        "train_ce_loss": avg_train_ce,
                         "val_loss": avg_val_loss,
+                        "val_mse_loss": avg_val_mse,
+                        "val_ce_loss": avg_val_ce,
                         "best_val_loss": best_val_loss,
                         "checkpoint_saved": int(improved),
                         "ce_weight": ce_weight,
+                        "learning_rate": current_lr,
+                        "epochs_without_improvement": epochs_without_improvement,
                         "distinct_1": diversity["distinct_1"],
                         "distinct_2": diversity["distinct_2"],
                         "token_entropy": diversity["token_entropy"],
@@ -525,8 +675,21 @@ def main():
             if (epoch + 1) % 2 == 0 or epoch == 0:
                 print(
                     f"Epoch [{epoch + 1}/{args.epochs}] | "
-                    f"Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}"
+                    f"Train Loss: {avg_train_loss:.4f} (MSE {avg_train_mse:.4f}, CE {avg_train_ce:.4f}) | "
+                    f"Val Loss: {avg_val_loss:.4f} (MSE {avg_val_mse:.4f}, CE {avg_val_ce:.4f}) | "
+                    f"LR: {current_lr:.2e}"
                 )
+
+            if (
+                args.early_stop_patience > 0
+                and epochs_without_improvement >= args.early_stop_patience
+            ):
+                print(
+                    "Early stopping triggered: "
+                    f"no val improvement > {args.early_stop_min_delta} for "
+                    f"{args.early_stop_patience} epoch(s)."
+                )
+                break
     finally:
         if wandb_run is not None:
             wandb_run.finish()
