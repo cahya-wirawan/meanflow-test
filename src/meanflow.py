@@ -48,9 +48,10 @@ class MeanFlowLanguageModel(nn.Module):
         pred_x1 = self.output_head(hidden)
         return pred_x1
 
-    def compute_loss(self, input_ids):
+    def compute_loss(self, input_ids, pad_token_id=50256):
         """
         The training objective: teaches the model the Mean Flow trajectory.
+        Includes masking to ignore padding tokens.
         """
         batch_size, seq_len = input_ids.shape
         
@@ -65,24 +66,31 @@ class MeanFlowLanguageModel(nn.Module):
         t_expanded = t.unsqueeze(-1) # Match dimensions [batch, 1, 1]
         
         # Step D: Construct the straight flow path (Linear Interpolation)
-        # This creates the noisy intermediate state x_t
         x_t = t_expanded * x_1 + (1 - t_expanded) * x_0
         
         # Step E: Predict the target
-        # For a linear 1-step trajectory, predicting the interval-averaged velocity 
-        # is mathematically equivalent to predicting the final destination x_1.
         pred_x1 = self.forward_net(x_t, t)
         
+        # --- Masking Logic ---
+        # Create a mask for non-padding tokens [batch, seq_len]
+        mask = (input_ids != pad_token_id).float()
+        mask_expanded = mask.unsqueeze(-1) # [batch, seq_len, 1]
+        
         # Step F: The Mean Flow Continuous Loss (Mean Squared Error)
-        mse_loss = F.mse_loss(pred_x1, x_1)
+        # We manually compute the masked MSE
+        diff = (pred_x1 - x_1) * mask_expanded
+        mse_loss = (diff**2).sum() / (mask.sum() * self.d_model + 1e-6)
         
-        # Step G: Auxiliary Classification Loss (to ensure the continuous vector 
-        # aligns perfectly with the discrete vocabulary)
+        # Step G: Auxiliary Classification Loss
         logits = self.lm_head(pred_x1)
-        ce_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), input_ids.view(-1))
+        ce_loss = F.cross_entropy(
+            logits.view(-1, logits.size(-1)), 
+            input_ids.view(-1),
+            ignore_index=pad_token_id
+        )
         
-        # Combine the losses
-        return mse_loss + 0.1 * ce_loss
+        # Combine the losses (Increased CE weight to 0.5 to help early convergence)
+        return mse_loss + 0.5 * ce_loss
 
     @torch.no_grad()
     def generate_1_step(self, batch_size, seq_len, device="cpu"):
