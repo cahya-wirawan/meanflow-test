@@ -54,7 +54,7 @@ class MeanFlowLanguageModel(nn.Module):
         pred_x1 = self.output_head(hidden)
         return pred_x1
 
-    def compute_loss(self, input_ids, pad_token_id=None):
+    def compute_loss(self, input_ids, pad_token_id=None, ce_weight=0.5, t_sample_power=1.0):
         """
         The training objective: teaches the model the Mean Flow trajectory.
         Includes masking to ignore padding tokens.
@@ -67,8 +67,12 @@ class MeanFlowLanguageModel(nn.Module):
         # Step B: Sample the starting pure noise state (x_0)
         x_0 = torch.randn_like(x_1) 
         
-        # Step C: Pick a random time t between 0 and 1
-        t = torch.rand(batch_size, 1, device=x_1.device)
+        # Step C: Pick a random time t between 0 and 1.
+        # Using t_sample_power > 1 biases sampling toward t ~ 0,
+        # which better matches 1-step inference conditions.
+        if t_sample_power <= 0:
+            raise ValueError("t_sample_power must be > 0")
+        t = torch.rand(batch_size, 1, device=x_1.device).pow(t_sample_power)
         t_expanded = t.unsqueeze(-1) # Match dimensions [batch, 1, 1]
         
         # Step D: Construct the straight flow path (Linear Interpolation)
@@ -104,11 +108,19 @@ class MeanFlowLanguageModel(nn.Module):
                 ignore_index=pad_token_id,
             )
         
-        # Combine the losses (Increased CE weight to 0.5 to help early convergence)
-        return mse_loss + 0.5 * ce_loss
+        # Combine the losses with configurable CE weighting.
+        return mse_loss + ce_weight * ce_loss
 
     @torch.no_grad()
-    def generate_1_step(self, batch_size, seq_len, device="cpu"):
+    def generate_1_step(
+        self,
+        batch_size,
+        seq_len,
+        device="cpu",
+        sample=False,
+        temperature=1.0,
+        top_k=0,
+    ):
         """
         Inference: Generates an entire block of text simultaneously in 1 step.
         """
@@ -123,6 +135,25 @@ class MeanFlowLanguageModel(nn.Module):
         
         # 4. Round the continuous state back to discrete text tokens
         logits = self.lm_head(pred_x1)
-        tokens = torch.argmax(logits, dim=-1)
+        if not sample:
+            tokens = torch.argmax(logits, dim=-1)
+            return tokens
+
+        if temperature <= 0:
+            raise ValueError("temperature must be > 0")
+
+        logits = logits / temperature
+
+        if top_k > 0:
+            k = min(top_k, logits.size(-1))
+            topk_logits, topk_indices = torch.topk(logits, k=k, dim=-1)
+            probs = F.softmax(topk_logits, dim=-1)
+            sampled = torch.multinomial(probs.reshape(-1, k), num_samples=1)
+            sampled = sampled.view(batch_size, seq_len, 1)
+            tokens = topk_indices.gather(-1, sampled).squeeze(-1)
+        else:
+            probs = F.softmax(logits, dim=-1)
+            sampled = torch.multinomial(probs.reshape(-1, probs.size(-1)), num_samples=1)
+            tokens = sampled.view(batch_size, seq_len)
         
         return tokens

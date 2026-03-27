@@ -75,6 +75,41 @@ def parse_args():
             "Use auto to pick CUDA, then MPS, then CPU; explicit values enforce a specific backend."
         ),
     )
+    parser.add_argument(
+        "--sample",
+        action="store_true",
+        help=(
+            "Enable stochastic decoding instead of greedy argmax. "
+            "Recommended to reduce repetitive outputs such as 'the the the'."
+        ),
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=1.0,
+        help=(
+            "Sampling temperature when --sample is enabled. "
+            "Higher values increase diversity; lower values make outputs more deterministic."
+        ),
+    )
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=50,
+        help=(
+            "Top-k truncation for sampling when --sample is enabled. "
+            "Set 0 to sample from full vocabulary distribution."
+        ),
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help=(
+            "Optional random seed for reproducible sampling. "
+            "Ignored for deterministic greedy decoding unless stochastic ops are used."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -93,28 +128,30 @@ def pick_device(device_name="auto"):
     return torch.device("cpu")
 
 
-def generate_text(model, tokenizer, num_sequences=3, seq_len=32, device=torch.device("cpu")):
+def generate_text(
+    model,
+    tokenizer,
+    num_sequences=3,
+    seq_len=32,
+    device="cpu",
+    sample=False,
+    temperature=1.0,
+    top_k=50,
+):
     print("\n--- Generating New Text ---")
     model.eval() # Set the model to evaluation mode (turns off dropout, etc.)
     
     with torch.no_grad(): # We don't need gradients for inference
-        # 1. Start with a block of pure Gaussian noise (x_0)
-        # Shape: [Batch Size, Sequence Length, Embedding Dimension]
-        x_0 = torch.randn(num_sequences, seq_len, model.d_model, device=device)
-        
-        # 2. Tell the model we are at time t = 0 (the starting line)
-        t = torch.zeros(num_sequences, 1, device=device)
-        
-        # 3. The 1-Step Jump! Predict the final continuous state (x_1)
-        pred_x1 = model.forward_net(x_0, t)
-        
-        # 4. The "Rounding" Step: Project continuous vectors to vocabulary logits
-        logits = model.lm_head(pred_x1)
-        
-        # 5. Pick the most likely word for each position (Greedy Decoding)
-        predicted_token_ids = torch.argmax(logits, dim=-1)
-        
-        # 6. Decode the token IDs back into readable English strings
+        predicted_token_ids = model.generate_1_step(
+            batch_size=num_sequences,
+            seq_len=seq_len,
+            device=str(device),
+            sample=sample,
+            temperature=temperature,
+            top_k=top_k,
+        )
+
+        # Decode the token IDs back into readable English strings
         for i in range(num_sequences):
             # Extract the raw IDs for this specific sequence
             token_ids = predicted_token_ids[i].tolist()
@@ -129,6 +166,15 @@ if __name__ == "__main__":
     args = parse_args()
     if args.seq_len <= 0 or args.num_sequences <= 0:
         raise ValueError("--seq-len and --num-sequences must be > 0")
+    if args.temperature <= 0:
+        raise ValueError("--temperature must be > 0")
+    if args.top_k < 0:
+        raise ValueError("--top-k must be >= 0")
+
+    if args.seed is not None:
+        torch.manual_seed(args.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(args.seed)
 
     from transformers import AutoTokenizer
     from meanflow import MeanFlowLanguageModel
@@ -160,5 +206,8 @@ if __name__ == "__main__":
         tokenizer,
         num_sequences=args.num_sequences,
         seq_len=args.seq_len,
-        device=device,
+        device=str(device),
+        sample=args.sample,
+        temperature=args.temperature,
+        top_k=args.top_k,
     )

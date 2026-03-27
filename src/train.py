@@ -5,6 +5,7 @@ from datasets import load_dataset
 import random
 from typing import Any
 import argparse
+import math
 
 SEQ_LEN = 128
 BATCH_SIZE = 16
@@ -132,6 +133,60 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--t-sample-power",
+        type=float,
+        default=2.0,
+        help=(
+            "Power for sampling flow time t as U^p. "
+            "Values > 1 bias training toward t near 0 to better match inference."
+        ),
+    )
+    parser.add_argument(
+        "--ce-weight-start",
+        type=float,
+        default=0.5,
+        help=(
+            "Initial CE coefficient in the combined loss. "
+            "Higher values emphasize discrete token prediction early in training."
+        ),
+    )
+    parser.add_argument(
+        "--ce-weight-end",
+        type=float,
+        default=1.0,
+        help=(
+            "Final CE coefficient reached by linear schedule at last epoch. "
+            "Useful to reduce collapse to frequent tokens."
+        ),
+    )
+    parser.add_argument(
+        "--diagnostic-samples",
+        type=int,
+        default=4,
+        help=(
+            "Number of sequences generated each epoch for collapse diagnostics. "
+            "Used for entropy and distinct-n metrics logging."
+        ),
+    )
+    parser.add_argument(
+        "--diagnostic-temperature",
+        type=float,
+        default=1.0,
+        help=(
+            "Sampling temperature for diagnostic generation. "
+            "Higher values increase diversity; lower values increase determinism."
+        ),
+    )
+    parser.add_argument(
+        "--diagnostic-top-k",
+        type=int,
+        default=50,
+        help=(
+            "Top-k truncation for diagnostic generation. "
+            "Set to 0 to sample from full vocabulary distribution."
+        ),
+    )
+    parser.add_argument(
         "--wandb",
         action="store_true",
         help=(
@@ -213,6 +268,43 @@ def validate_args(args):
         raise ValueError("--d-model, --num-heads, and --num-layers must be > 0")
     if args.wandb_log_interval < 0:
         raise ValueError("--wandb-log-interval must be >= 0")
+    if args.t_sample_power <= 0:
+        raise ValueError("--t-sample-power must be > 0")
+    if args.ce_weight_start < 0 or args.ce_weight_end < 0:
+        raise ValueError("--ce-weight-start and --ce-weight-end must be >= 0")
+    if args.diagnostic_samples <= 0:
+        raise ValueError("--diagnostic-samples must be > 0")
+    if args.diagnostic_temperature <= 0:
+        raise ValueError("--diagnostic-temperature must be > 0")
+    if args.diagnostic_top_k < 0:
+        raise ValueError("--diagnostic-top-k must be >= 0")
+
+
+def compute_diversity_metrics(tokens, vocab_size):
+    flat = tokens.reshape(-1)
+    total_tokens = max(1, flat.numel())
+
+    unigram_count = torch.unique(flat).numel()
+    distinct_1 = unigram_count / total_tokens
+
+    if tokens.size(1) > 1:
+        bigrams = torch.stack([tokens[:, :-1], tokens[:, 1:]], dim=-1).reshape(-1, 2)
+        distinct_2 = torch.unique(bigrams, dim=0).size(0) / max(1, bigrams.size(0))
+    else:
+        distinct_2 = 0.0
+
+    counts = torch.bincount(flat, minlength=vocab_size).float()
+    probs = counts / counts.sum().clamp_min(1.0)
+    nz = probs > 0
+    entropy = -(probs[nz] * probs[nz].log()).sum().item()
+    norm_entropy = entropy / max(1e-8, math.log(vocab_size))
+
+    return {
+        "distinct_1": float(distinct_1),
+        "distinct_2": float(distinct_2),
+        "token_entropy": float(entropy),
+        "token_entropy_norm": float(norm_entropy),
+    }
 
 def main():
     args = parse_args()
@@ -324,6 +416,12 @@ def main():
                 "num_heads": args.num_heads,
                 "num_layers": args.num_layers,
                 "wandb_log_interval": args.wandb_log_interval,
+                "t_sample_power": args.t_sample_power,
+                "ce_weight_start": args.ce_weight_start,
+                "ce_weight_end": args.ce_weight_end,
+                "diagnostic_samples": args.diagnostic_samples,
+                "diagnostic_temperature": args.diagnostic_temperature,
+                "diagnostic_top_k": args.diagnostic_top_k,
                 "device": str(device),
                 "train_blocks": len(train_dataset),
                 "val_blocks": len(val_dataset),
@@ -339,11 +437,23 @@ def main():
         for epoch in range(args.epochs):
             model.train()
             total_train_loss = 0.0
+            if args.epochs == 1:
+                epoch_progress = 1.0
+            else:
+                epoch_progress = epoch / (args.epochs - 1)
+            ce_weight = args.ce_weight_start + (
+                args.ce_weight_end - args.ce_weight_start
+            ) * epoch_progress
 
             for batch in train_dataloader:
                 input_ids = batch["input_ids"].to(device)
                 optimizer.zero_grad()
-                loss = model.compute_loss(input_ids, pad_token_id=None)
+                loss = model.compute_loss(
+                    input_ids,
+                    pad_token_id=None,
+                    ce_weight=ce_weight,
+                    t_sample_power=args.t_sample_power,
+                )
                 loss.backward()
                 optimizer.step()
                 global_step += 1
@@ -370,7 +480,12 @@ def main():
             with torch.no_grad():
                 for batch in val_dataloader:
                     input_ids = batch["input_ids"].to(device)
-                    val_loss = model.compute_loss(input_ids, pad_token_id=None)
+                    val_loss = model.compute_loss(
+                        input_ids,
+                        pad_token_id=None,
+                        ce_weight=ce_weight,
+                        t_sample_power=args.t_sample_power,
+                    )
                     total_val_loss += val_loss.item()
 
             avg_val_loss = total_val_loss / len(val_dataloader)
@@ -381,6 +496,15 @@ def main():
                 torch.save(model.state_dict(), args.model_path)
 
             if wandb_run is not None:
+                diagnostic_tokens = model.generate_1_step(
+                    batch_size=args.diagnostic_samples,
+                    seq_len=args.seq_len,
+                    device=str(device),
+                    sample=True,
+                    temperature=args.diagnostic_temperature,
+                    top_k=args.diagnostic_top_k,
+                )
+                diversity = compute_diversity_metrics(diagnostic_tokens, vocab_size=vocab_size)
                 wandb_run.log(
                     {
                         "epoch": epoch + 1,
@@ -388,6 +512,11 @@ def main():
                         "val_loss": avg_val_loss,
                         "best_val_loss": best_val_loss,
                         "checkpoint_saved": int(improved),
+                        "ce_weight": ce_weight,
+                        "distinct_1": diversity["distinct_1"],
+                        "distinct_2": diversity["distinct_2"],
+                        "token_entropy": diversity["token_entropy"],
+                        "token_entropy_norm": diversity["token_entropy_norm"],
                         "global_step": global_step,
                     },
                     step=global_step,
