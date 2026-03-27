@@ -41,6 +41,12 @@ Ensure you have the required dependencies installed:
 pip install torch transformers datasets
 ```
 
+Optional experiment tracking with Weights & Biases:
+
+```bash
+pip install wandb
+```
+
 ### Training
 
 To train the model on a sample of the WikiText-2 dataset:
@@ -53,6 +59,18 @@ You can override key run settings from the command line, for example:
 
 ```bash
 python src/train.py --epochs 20 --batch-size 8 --dataset-split "train[:10%]" --model-path src/meanflow_language_model.pth
+```
+
+Enable W&B logging during training:
+
+```bash
+python src/train.py --wandb --wandb-project meanflow --wandb-run-name "baseline-v1"
+```
+
+For local/offline logging:
+
+```bash
+python src/train.py --wandb --wandb-mode offline
 ```
 
 The training pipeline uses **Text Grouping**, where all tokenized examples are concatenated and split into equal blocks of `SEQ_LEN`. This removes the bias caused by padding short sentences and ensures the model only learns from real data.

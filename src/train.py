@@ -15,6 +15,7 @@ DATASET_SPLIT = "train[:5%]"
 VAL_RATIO = 0.1
 MODEL_PATH = "src/meanflow_language_model.pth"
 NUM_PROC = 4
+WANDB_PROJECT = "meanflow"
 
 
 def parse_args():
@@ -130,6 +131,60 @@ def parse_args():
             "More layers increase representational depth and runtime."
         ),
     )
+    parser.add_argument(
+        "--wandb",
+        action="store_true",
+        help=(
+            "Enable Weights & Biases experiment tracking. "
+            "When set, epoch metrics and run config are logged to W&B."
+        ),
+    )
+    parser.add_argument(
+        "--wandb-project",
+        type=str,
+        default=WANDB_PROJECT,
+        help=(
+            "W&B project name to log runs into. "
+            "Create a new project in your W&B workspace if it does not exist."
+        ),
+    )
+    parser.add_argument(
+        "--wandb-entity",
+        type=str,
+        default=None,
+        help=(
+            "W&B entity (username or team). "
+            "Leave unset to use your default account/entity."
+        ),
+    )
+    parser.add_argument(
+        "--wandb-run-name",
+        type=str,
+        default=None,
+        help=(
+            "Optional custom W&B run name. "
+            "Useful for grouping experiment families by naming convention."
+        ),
+    )
+    parser.add_argument(
+        "--wandb-mode",
+        type=str,
+        choices=["online", "offline", "disabled"],
+        default="online",
+        help=(
+            "W&B logging mode. "
+            "Use offline to store logs locally for later sync."
+        ),
+    )
+    parser.add_argument(
+        "--wandb-log-interval",
+        type=int,
+        default=0,
+        help=(
+            "Batch-level W&B logging interval in optimizer steps. "
+            "Set to 0 to disable batch logging; use values like 10 or 50 to reduce log volume."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -156,6 +211,8 @@ def validate_args(args):
         raise ValueError("--num-proc must be > 0")
     if args.d_model <= 0 or args.num_heads <= 0 or args.num_layers <= 0:
         raise ValueError("--d-model, --num-heads, and --num-layers must be > 0")
+    if args.wandb_log_interval < 0:
+        raise ValueError("--wandb-log-interval must be >= 0")
 
 def main():
     args = parse_args()
@@ -163,6 +220,17 @@ def main():
 
     from transformers import AutoTokenizer
     from meanflow import MeanFlowLanguageModel
+
+    wandb: Any = None
+    wandb_run = None
+    if args.wandb:
+        try:
+            import wandb  # type: ignore
+        except ImportError as exc:
+            raise ImportError(
+                "W&B tracking requested but 'wandb' is not installed. "
+                "Install it with: pip install wandb"
+            ) from exc
 
     random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -236,42 +304,103 @@ def main():
     ).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
 
+    if args.wandb:
+        wandb_run = wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=args.wandb_run_name,
+            mode=args.wandb_mode,
+            config={
+                "seq_len": args.seq_len,
+                "batch_size": args.batch_size,
+                "epochs": args.epochs,
+                "learning_rate": args.learning_rate,
+                "seed": args.seed,
+                "dataset_split": args.dataset_split,
+                "val_ratio": args.val_ratio,
+                "model_path": args.model_path,
+                "num_proc": args.num_proc,
+                "d_model": args.d_model,
+                "num_heads": args.num_heads,
+                "num_layers": args.num_layers,
+                "wandb_log_interval": args.wandb_log_interval,
+                "device": str(device),
+                "train_blocks": len(train_dataset),
+                "val_blocks": len(val_dataset),
+            },
+        )
+        print(f"W&B enabled: project={args.wandb_project} mode={args.wandb_mode}")
+
     print("\nStarting Training...")
     best_val_loss = float("inf")
+    global_step = 0
 
-    for epoch in range(args.epochs):
-        model.train()
-        total_train_loss = 0.0
+    try:
+        for epoch in range(args.epochs):
+            model.train()
+            total_train_loss = 0.0
 
-        for batch in train_dataloader:
-            input_ids = batch["input_ids"].to(device)
-            optimizer.zero_grad()
-            loss = model.compute_loss(input_ids, pad_token_id=None)
-            loss.backward()
-            optimizer.step()
-            total_train_loss += loss.item()
-
-        avg_train_loss = total_train_loss / len(train_dataloader)
-
-        model.eval()
-        total_val_loss = 0.0
-        with torch.no_grad():
-            for batch in val_dataloader:
+            for batch in train_dataloader:
                 input_ids = batch["input_ids"].to(device)
-                val_loss = model.compute_loss(input_ids, pad_token_id=None)
-                total_val_loss += val_loss.item()
+                optimizer.zero_grad()
+                loss = model.compute_loss(input_ids, pad_token_id=None)
+                loss.backward()
+                optimizer.step()
+                global_step += 1
+                total_train_loss += loss.item()
 
-        avg_val_loss = total_val_loss / len(val_dataloader)
+                if (
+                    wandb_run is not None
+                    and args.wandb_log_interval > 0
+                    and global_step % args.wandb_log_interval == 0
+                ):
+                    wandb_run.log(
+                        {
+                            "batch_loss": loss.item(),
+                            "epoch": epoch + 1,
+                            "global_step": global_step,
+                        },
+                        step=global_step,
+                    )
 
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
-            torch.save(model.state_dict(), args.model_path)
+            avg_train_loss = total_train_loss / len(train_dataloader)
 
-        if (epoch + 1) % 2 == 0 or epoch == 0:
-            print(
-                f"Epoch [{epoch + 1}/{args.epochs}] | "
-                f"Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}"
-            )
+            model.eval()
+            total_val_loss = 0.0
+            with torch.no_grad():
+                for batch in val_dataloader:
+                    input_ids = batch["input_ids"].to(device)
+                    val_loss = model.compute_loss(input_ids, pad_token_id=None)
+                    total_val_loss += val_loss.item()
+
+            avg_val_loss = total_val_loss / len(val_dataloader)
+
+            improved = avg_val_loss < best_val_loss
+            if improved:
+                best_val_loss = avg_val_loss
+                torch.save(model.state_dict(), args.model_path)
+
+            if wandb_run is not None:
+                wandb_run.log(
+                    {
+                        "epoch": epoch + 1,
+                        "train_loss": avg_train_loss,
+                        "val_loss": avg_val_loss,
+                        "best_val_loss": best_val_loss,
+                        "checkpoint_saved": int(improved),
+                        "global_step": global_step,
+                    },
+                    step=global_step,
+                )
+
+            if (epoch + 1) % 2 == 0 or epoch == 0:
+                print(
+                    f"Epoch [{epoch + 1}/{args.epochs}] | "
+                    f"Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}"
+                )
+    finally:
+        if wandb_run is not None:
+            wandb_run.finish()
 
     print("\nTraining Complete!")
     print(f"Best validation loss: {best_val_loss:.4f}")
