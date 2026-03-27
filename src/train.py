@@ -18,6 +18,7 @@ VAL_RATIO = 0.1
 MODEL_PATH = "src/meanflow_language_model.pth"
 NUM_PROC = 4
 WANDB_PROJECT = "meanflow"
+MIN_TEXT_CHARS = 32
 
 
 def parse_args():
@@ -77,6 +78,15 @@ def parse_args():
         help=(
             "Hugging Face split selector passed to load_dataset, for example train[:5%%]. "
             "Use this to quickly scale experiments up or down."
+        ),
+    )
+    parser.add_argument(
+        "--min-text-chars",
+        type=int,
+        default=MIN_TEXT_CHARS,
+        help=(
+            "Minimum non-whitespace character length for keeping a raw text line. "
+            "Higher values reduce noisy short fragments."
         ),
     )
     parser.add_argument(
@@ -140,6 +150,23 @@ def parse_args():
         help=(
             "Power for sampling flow time t as U^p. "
             "Values > 1 bias training toward t near 0 to better match inference."
+        ),
+    )
+    parser.add_argument(
+        "--t-zero-prob",
+        type=float,
+        default=0.1,
+        help=(
+            "Probability of forcing t=0 during training loss computation. "
+            "This directly trains the exact inference condition."
+        ),
+    )
+    parser.add_argument(
+        "--eval-at-t0",
+        action="store_true",
+        help=(
+            "Evaluate validation loss strictly at t=0. "
+            "This makes validation more aligned with one-step inference quality."
         ),
     )
     parser.add_argument(
@@ -323,8 +350,12 @@ def validate_args(args):
         raise ValueError("--d-model, --num-heads, and --num-layers must be > 0")
     if args.wandb_log_interval < 0:
         raise ValueError("--wandb-log-interval must be >= 0")
+    if args.min_text_chars < 0:
+        raise ValueError("--min-text-chars must be >= 0")
     if args.t_sample_power <= 0:
         raise ValueError("--t-sample-power must be > 0")
+    if not (0.0 <= args.t_zero_prob <= 1.0):
+        raise ValueError("--t-zero-prob must be between 0 and 1")
     if args.ce_weight_start < 0 or args.ce_weight_end < 0:
         raise ValueError("--ce-weight-start and --ce-weight-end must be >= 0")
     if args.diagnostic_samples <= 0:
@@ -372,13 +403,27 @@ def compute_diversity_metrics(tokens, vocab_size):
     }
 
 
-def compute_loss_components(model, input_ids, pad_token_id=None, ce_weight=0.5, t_sample_power=1.0):
+def compute_loss_components(
+    model,
+    input_ids,
+    pad_token_id=None,
+    ce_weight=0.5,
+    t_sample_power=1.0,
+    t_zero_prob=0.0,
+    eval_at_t0=False,
+):
     batch_size, _ = input_ids.shape
 
     x_1 = model.embedding(input_ids)
     x_0 = torch.randn_like(x_1)
 
-    t = torch.rand(batch_size, 1, device=x_1.device).pow(t_sample_power)
+    if eval_at_t0:
+        t = torch.zeros(batch_size, 1, device=x_1.device)
+    else:
+        t = torch.rand(batch_size, 1, device=x_1.device).pow(t_sample_power)
+        if t_zero_prob > 0:
+            zero_mask = (torch.rand(batch_size, 1, device=x_1.device) < t_zero_prob)
+            t = torch.where(zero_mask, torch.zeros_like(t), t)
     t_expanded = t.unsqueeze(-1)
     x_t = t_expanded * x_1 + (1 - t_expanded) * x_0
 
@@ -443,11 +488,15 @@ def main():
 
     print("Downloading/Loading Dataset...")
     raw_dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split=args.dataset_split)
-    raw_dataset = raw_dataset.filter(lambda x: len(x["text"].strip()) > 0)
+    raw_dataset = raw_dataset.filter(lambda x: len(x["text"].strip()) >= args.min_text_chars)
     split_dataset = raw_dataset.train_test_split(test_size=args.val_ratio, seed=args.seed)
 
     def tokenize_function(examples):
-        return tokenizer(examples["text"])
+        # Add EOS separators between samples so grouped text keeps document boundaries.
+        tokenized = tokenizer(examples["text"], add_special_tokens=False)
+        eos_id = tokenizer.eos_token_id
+        tokenized["input_ids"] = [ids + [eos_id] for ids in tokenized["input_ids"]]
+        return tokenized
 
     print("Tokenizing data...")
     tokenized_datasets = split_dataset.map(
@@ -520,6 +569,7 @@ def main():
                 "learning_rate": args.learning_rate,
                 "seed": args.seed,
                 "dataset_split": args.dataset_split,
+                "min_text_chars": args.min_text_chars,
                 "val_ratio": args.val_ratio,
                 "model_path": args.model_path,
                 "num_proc": args.num_proc,
@@ -528,6 +578,8 @@ def main():
                 "num_layers": args.num_layers,
                 "wandb_log_interval": args.wandb_log_interval,
                 "t_sample_power": args.t_sample_power,
+                "t_zero_prob": args.t_zero_prob,
+                "eval_at_t0": args.eval_at_t0,
                 "ce_weight_start": args.ce_weight_start,
                 "ce_weight_end": args.ce_weight_end,
                 "diagnostic_samples": args.diagnostic_samples,
@@ -574,6 +626,8 @@ def main():
                     pad_token_id=None,
                     ce_weight=ce_weight,
                     t_sample_power=args.t_sample_power,
+                    t_zero_prob=args.t_zero_prob,
+                    eval_at_t0=False,
                 )
                 loss.backward()
                 if args.grad_clip_norm > 0:
@@ -617,6 +671,8 @@ def main():
                         pad_token_id=None,
                         ce_weight=ce_weight,
                         t_sample_power=args.t_sample_power,
+                        t_zero_prob=0.0,
+                        eval_at_t0=args.eval_at_t0,
                     )
                     total_val_loss += val_loss.item()
                     total_val_mse += val_mse.item()
