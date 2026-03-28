@@ -227,7 +227,7 @@ def generate_text(
 
                 t_value += dt
 
-            logits = model.lm_head(x_t)
+            logits = model.lm_logits(x_t)
             if not sample:
                 predicted_token_ids = torch.argmax(logits, dim=-1)
             else:

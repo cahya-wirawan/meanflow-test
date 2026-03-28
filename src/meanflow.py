@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 
 
 class TimeConditionedTransformerBlock(nn.Module):
@@ -83,6 +84,15 @@ class MeanFlowLanguageModel(nn.Module):
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
         # Often, we tie the weights of the embedding and LM head for efficiency:
         self.lm_head.weight = self.embedding.weight 
+        # Learnable logit temperature for cosine logits; helps avoid exploding CE.
+        self.logit_scale = nn.Parameter(torch.tensor(math.log(math.sqrt(d_model))))
+
+    def lm_logits(self, hidden_states):
+        # Cosine-similarity logits with bounded learnable temperature.
+        hidden = F.normalize(hidden_states, dim=-1)
+        weight = F.normalize(self.lm_head.weight, dim=-1)
+        scale = self.logit_scale.exp().clamp(min=1.0, max=100.0)
+        return F.linear(hidden, weight) * scale
 
     def _forward_target(self, x_t, t):
         t_emb = self.time_embed(t)  # [batch, d_model]
@@ -161,7 +171,7 @@ class MeanFlowLanguageModel(nn.Module):
         mse_loss = (diff**2).sum() / (mask.sum() * self.d_model + 1e-6)
         
         # Step G: Auxiliary Classification Loss
-        logits = self.lm_head(pred_x1)
+        logits = self.lm_logits(pred_x1)
         if pad_token_id is None:
             ce_loss = F.cross_entropy(
                 logits.view(-1, logits.size(-1)),
@@ -200,7 +210,7 @@ class MeanFlowLanguageModel(nn.Module):
         pred_x1 = self.forward_net(x_0, t)
         
         # 4. Round the continuous state back to discrete text tokens
-        logits = self.lm_head(pred_x1)
+        logits = self.lm_logits(pred_x1)
         if not sample:
             tokens = torch.argmax(logits, dim=-1)
             return tokens
