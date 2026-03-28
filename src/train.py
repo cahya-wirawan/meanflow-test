@@ -480,7 +480,12 @@ def compute_loss_components(
     # (x_t ≈ noise) produce near-random pred_x1 that would dominate CE with
     # uninformative gradients.  t=0 forced samples still contribute via MSE.
     # t: [batch, 1] -> ce_weights: [batch, seq_len]
-    ce_weights = (t ** 2).expand_as(input_ids).reshape(-1)  # [batch * seq_len]
+    if eval_at_t0:
+        # At t=0, t²=0 would zero out all CE; use uniform weights instead
+        # since eval_at_t0 is meant to measure prediction quality at t=0.
+        ce_weights = torch.ones(input_ids.numel(), device=input_ids.device)
+    else:
+        ce_weights = (t ** 2).expand_as(input_ids).reshape(-1)  # [batch * seq_len]
     if pad_token_id is not None:
         pad_mask = (input_ids != pad_token_id).float().reshape(-1)
         ce_weights = ce_weights * pad_mask
