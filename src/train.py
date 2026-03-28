@@ -684,13 +684,13 @@ def main():
             val_ce_perplexity = math.exp(avg_val_ce)
 
             if scheduler is not None:
-                scheduler.step(avg_val_loss)
+                scheduler.step(avg_val_ce)
 
             current_lr = optimizer.param_groups[0]["lr"]
 
-            improved = avg_val_loss < (best_val_loss - args.early_stop_min_delta)
+            improved = avg_val_ce < (best_val_loss - args.early_stop_min_delta)
             if improved:
-                best_val_loss = avg_val_loss
+                best_val_loss = avg_val_ce
                 torch.save(model.state_dict(), args.model_path)
                 epochs_without_improvement = 0
             else:
