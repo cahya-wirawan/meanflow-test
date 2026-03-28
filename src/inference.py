@@ -66,6 +66,16 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--prediction-target",
+        type=str,
+        choices=["x1", "v"],
+        default="x1",
+        help=(
+            "Prediction target used by the checkpoint architecture. "
+            "Must match training configuration (x1 or v)."
+        ),
+    )
+    parser.add_argument(
         "--device",
         type=str,
         choices=["auto", "cpu", "cuda", "mps"],
@@ -173,18 +183,14 @@ def generate_text(
                 top_k=top_k,
             )
         else:
-            # Few-step integration using an inferred velocity field.
-            # v_hat(x_t, t) = (pred_x1 - x_t) / (1 - t)
+            # Few-step integration using model velocity predictions.
             x_t = torch.randn(num_sequences, seq_len, model.d_model, device=device)
             dt = 1.0 / integration_steps
             t_value = 0.0
-            eps = 1e-4
 
             for _ in range(integration_steps):
                 t = torch.full((num_sequences, 1), t_value, device=device)
-                pred_x1 = model.forward_net(x_t, t)
-                denom = max(1.0 - t_value, eps)
-                v_hat = (pred_x1 - x_t) / denom
+                v_hat = model.predict_velocity(x_t, t)
 
                 if integration_method == "heun":
                     # Predictor step (Euler proposal)
@@ -193,9 +199,7 @@ def generate_text(
                     t_next = torch.full((num_sequences, 1), t_next_value, device=device)
 
                     # Corrector velocity at predicted next state
-                    pred_x1_next = model.forward_net(x_pred, t_next)
-                    denom_next = max(1.0 - t_next_value, eps)
-                    v_hat_next = (pred_x1_next - x_pred) / denom_next
+                    v_hat_next = model.predict_velocity(x_pred, t_next)
 
                     # Heun update: average current and predicted slopes
                     x_t = x_t + 0.5 * dt * (v_hat + v_hat_next)
@@ -206,20 +210,15 @@ def generate_text(
                     t2_value = min(t_value + 0.5 * dt, 1.0)
                     t2 = torch.full((num_sequences, 1), t2_value, device=device)
                     x2 = x_t + 0.5 * dt * k1
-                    pred_x1_2 = model.forward_net(x2, t2)
-                    denom2 = max(1.0 - t2_value, eps)
-                    k2 = (pred_x1_2 - x2) / denom2
+                    k2 = model.predict_velocity(x2, t2)
 
                     x3 = x_t + 0.5 * dt * k2
-                    pred_x1_3 = model.forward_net(x3, t2)
-                    k3 = (pred_x1_3 - x3) / denom2
+                    k3 = model.predict_velocity(x3, t2)
 
                     t4_value = min(t_value + dt, 1.0)
                     t4 = torch.full((num_sequences, 1), t4_value, device=device)
                     x4 = x_t + dt * k3
-                    pred_x1_4 = model.forward_net(x4, t4)
-                    denom4 = max(1.0 - t4_value, eps)
-                    k4 = (pred_x1_4 - x4) / denom4
+                    k4 = model.predict_velocity(x4, t4)
 
                     x_t = x_t + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
                 else:
@@ -294,6 +293,7 @@ if __name__ == "__main__":
         num_heads=args.num_heads,
         num_layers=args.num_layers,
         max_seq_len=args.seq_len,
+        prediction_target=args.prediction_target,
     ).to(device)
 
     # Load the trained model weights (if you have them saved)

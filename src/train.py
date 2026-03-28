@@ -144,6 +144,16 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--prediction-target",
+        type=str,
+        choices=["x1", "v"],
+        default="x1",
+        help=(
+            "Model prediction target for flow training. "
+            "x1 predicts final clean embeddings directly, while v predicts flow velocity."
+        ),
+    )
+    parser.add_argument(
         "--t-sample-power",
         type=float,
         default=2.0,
@@ -348,6 +358,8 @@ def validate_args(args):
         raise ValueError("--num-proc must be > 0")
     if args.d_model <= 0 or args.num_heads <= 0 or args.num_layers <= 0:
         raise ValueError("--d-model, --num-heads, and --num-layers must be > 0")
+    if args.prediction_target not in {"x1", "v"}:
+        raise ValueError("--prediction-target must be one of: x1, v")
     if args.wandb_log_interval < 0:
         raise ValueError("--wandb-log-interval must be >= 0")
     if args.min_text_chars < 0:
@@ -545,6 +557,7 @@ def main():
         num_heads=args.num_heads,
         num_layers=args.num_layers,
         max_seq_len=args.seq_len,
+        prediction_target=args.prediction_target,
     ).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
     scheduler = None
@@ -578,6 +591,7 @@ def main():
                 "d_model": args.d_model,
                 "num_heads": args.num_heads,
                 "num_layers": args.num_layers,
+                "prediction_target": args.prediction_target,
                 "wandb_log_interval": args.wandb_log_interval,
                 "t_sample_power": args.t_sample_power,
                 "t_zero_prob": args.t_zero_prob,
