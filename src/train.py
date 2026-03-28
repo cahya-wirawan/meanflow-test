@@ -439,16 +439,23 @@ def compute_loss_components(
     t_expanded = t.unsqueeze(-1)
     x_t = t_expanded * x_1 + (1 - t_expanded) * x_0
 
-    pred_x1 = model.forward_net(x_t, t)
-
     if pad_token_id is None:
         mask = torch.ones_like(input_ids, dtype=torch.float)
     else:
         mask = (input_ids != pad_token_id).float()
     mask_expanded = mask.unsqueeze(-1)
 
-    diff = (pred_x1 - x_1) * mask_expanded
-    mse_loss = (diff**2).sum() / (mask.sum() * model.d_model + 1e-6)
+    if getattr(model, "prediction_target", "x1") == "v":
+        # For linear bridges x_t = t*x1 + (1-t)*x0, the true velocity is constant: v = x1 - x0.
+        target_v = x_1 - x_0
+        pred_v = model.predict_velocity(x_t, t)
+        diff = (pred_v - target_v) * mask_expanded
+        mse_loss = (diff**2).sum() / (mask.sum() * model.d_model + 1e-6)
+        pred_x1 = x_t + (1 - t_expanded) * pred_v
+    else:
+        pred_x1 = model.forward_net(x_t, t)
+        diff = (pred_x1 - x_1) * mask_expanded
+        mse_loss = (diff**2).sum() / (mask.sum() * model.d_model + 1e-6)
 
     logits = model.lm_head(pred_x1)
     if pad_token_id is None:
