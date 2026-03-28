@@ -287,17 +287,46 @@ if __name__ == "__main__":
     vocab_size = len(tokenizer)
     print(f"Real Vocabulary Size: {vocab_size}")
 
+    # Load checkpoint — supports both new format (dict with config + state_dict)
+    # and legacy format (plain state_dict).
+    checkpoint = torch.load(args.model_path, map_location=device)
+    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+        config = checkpoint["config"]
+        state_dict = checkpoint["model_state_dict"]
+        d_model = config["d_model"]
+        num_heads = config["num_heads"]
+        num_layers = config["num_layers"]
+        prediction_target = config["prediction_target"]
+        seq_len = config.get("seq_len", args.seq_len)
+        print(
+            f"Loaded config from checkpoint: d_model={d_model}, "
+            f"num_heads={num_heads}, num_layers={num_layers}, "
+            f"prediction_target={prediction_target}, seq_len={seq_len}"
+        )
+    else:
+        # Legacy plain state_dict — use CLI args
+        state_dict = checkpoint
+        d_model = args.d_model
+        num_heads = args.num_heads
+        num_layers = args.num_layers
+        prediction_target = args.prediction_target
+        seq_len = args.seq_len
+        print(
+            "Legacy checkpoint (no config). Using CLI args: "
+            f"d_model={d_model}, num_heads={num_heads}, "
+            f"num_layers={num_layers}, prediction_target={prediction_target}"
+        )
+
     model = MeanFlowLanguageModel(
         vocab_size=vocab_size,
-        d_model=args.d_model,
-        num_heads=args.num_heads,
-        num_layers=args.num_layers,
-        max_seq_len=args.seq_len,
-        prediction_target=args.prediction_target,
+        d_model=d_model,
+        num_heads=num_heads,
+        num_layers=num_layers,
+        max_seq_len=seq_len,
+        prediction_target=prediction_target,
     ).to(device)
 
-    # Load the trained model weights (if you have them saved)
-    model.load_state_dict(torch.load(args.model_path, map_location=device))
+    model.load_state_dict(state_dict)
 
     generate_text(
         model,

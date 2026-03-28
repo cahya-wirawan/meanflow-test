@@ -750,7 +750,17 @@ def main():
             improved = avg_val_ce < (best_val_loss - args.early_stop_min_delta)
             if improved:
                 best_val_loss = avg_val_ce
-                torch.save(model.state_dict(), args.model_path)
+                torch.save({
+                    "model_state_dict": model.state_dict(),
+                    "config": {
+                        "d_model": args.d_model,
+                        "num_heads": args.num_heads,
+                        "num_layers": args.num_layers,
+                        "prediction_target": args.prediction_target,
+                        "seq_len": args.seq_len,
+                        "vocab_size": vocab_size,
+                    },
+                }, args.model_path)
                 epochs_without_improvement = 0
             else:
                 epochs_without_improvement += 1
