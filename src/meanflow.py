@@ -4,6 +4,34 @@ import torch.nn.functional as F
 import math
 
 
+def sinusoidal_embedding(timesteps, dim):
+    """Sinusoidal positional embedding for scalar timesteps (diffusion-style).
+
+    Converts a batch of scalar values into rich frequency representations,
+    giving the network access to multiple frequency bands of the input signal.
+    """
+    half_dim = dim // 2
+    emb = math.log(10000.0) / (half_dim - 1)
+    emb = torch.exp(torch.arange(half_dim, device=timesteps.device, dtype=torch.float32) * -emb)
+    emb = timesteps.float() * emb
+    emb = torch.cat([emb.sin(), emb.cos()], dim=-1)
+    if dim % 2 == 1:
+        emb = F.pad(emb, (0, 1))
+    return emb
+
+
+def _init_sinusoidal_positions(max_len, d_model):
+    """Create a sinusoidal positional encoding table (non-learnable init)."""
+    pe = torch.zeros(max_len, d_model)
+    position = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)
+    div_term = torch.exp(
+        torch.arange(0, d_model, 2, dtype=torch.float32) * -(math.log(10000.0) / d_model)
+    )
+    pe[:, 0::2] = torch.sin(position * div_term)
+    pe[:, 1::2] = torch.cos(position * div_term)
+    return pe.unsqueeze(0)  # [1, max_len, d_model]
+
+
 class TimeConditionedTransformerBlock(nn.Module):
     def __init__(self, d_model, num_heads, ff_mult=4, dropout=0.1):
         super().__init__()
@@ -20,6 +48,7 @@ class TimeConditionedTransformerBlock(nn.Module):
         self.ff = nn.Sequential(
             nn.Linear(d_model, ff_mult * d_model),
             nn.GELU(),
+            nn.Dropout(dropout),
             nn.Linear(ff_mult * d_model, d_model),
             nn.Dropout(dropout),
         )
@@ -52,6 +81,7 @@ class MeanFlowLanguageModel(nn.Module):
         num_layers=12,
         max_seq_len=256,
         prediction_target="x1",
+        dropout=0.1,
     ):
         super().__init__()
         self.d_model = d_model
@@ -62,23 +92,33 @@ class MeanFlowLanguageModel(nn.Module):
         
         # 1. The Continuous Bridge (Embedding & Positional Encoding)
         self.embedding = nn.Embedding(vocab_size, d_model)
-        self.pos_encoding = nn.Parameter(torch.randn(1, max_seq_len, d_model))
+        # Initialize positional encoding with sinusoidal values (learnable, but well-initialized).
+        self.pos_encoding = nn.Parameter(
+            _init_sinusoidal_positions(max_seq_len, d_model)
+        )
+        self.embed_dropout = nn.Dropout(dropout)
         
         # 2. The Time-Conditioned Transformer Backbone
         self.transformer = nn.ModuleList(
-            [TimeConditionedTransformerBlock(d_model, num_heads) for _ in range(num_layers)]
+            [TimeConditionedTransformerBlock(d_model, num_heads, dropout=dropout) for _ in range(num_layers)]
         )
         self.final_norm = nn.LayerNorm(d_model)
         
-        # Neural network needs to know "where" it is in the flow time [0, 1]
+        # Sinusoidal time embedding followed by MLP projection.
+        # This gives the network rich multi-frequency access to the flow time,
+        # rather than relying on a raw scalar input.
         self.time_embed = nn.Sequential(
-            nn.Linear(1, d_model),
+            nn.Linear(d_model, d_model),
             nn.SiLU(),
-            nn.Linear(d_model, d_model)
+            nn.Linear(d_model, d_model),
         )
         
         # 3. Output Head (Predicts the continuous vector)
-        self.output_head = nn.Linear(d_model, d_model)
+        self.output_head = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
+        )
         
         # 4. The "Rounding" Head (Maps continuous vector back to text probabilities)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
@@ -86,6 +126,12 @@ class MeanFlowLanguageModel(nn.Module):
         self.lm_head.weight = self.embedding.weight 
         # Learnable logit temperature for cosine logits; helps avoid exploding CE.
         self.logit_scale = nn.Parameter(torch.tensor(math.log(math.sqrt(d_model))))
+
+    def _get_time_embedding(self, t):
+        """Convert scalar timesteps to sinusoidal embeddings and project."""
+        # t: [batch, 1] -> sinusoidal_embedding expects [batch, 1]
+        sin_emb = sinusoidal_embedding(t, self.d_model)  # [batch, d_model]
+        return self.time_embed(sin_emb)  # [batch, d_model]
 
     def lm_logits(self, hidden_states):
         # Cosine-similarity logits with bounded learnable temperature.
@@ -95,14 +141,18 @@ class MeanFlowLanguageModel(nn.Module):
         return F.linear(hidden, weight) * scale
 
     def _forward_target(self, x_t, t):
-        t_emb = self.time_embed(t)  # [batch, d_model]
+        t_emb = self._get_time_embedding(t)  # [batch, d_model]
 
         if x_t.size(1) > self.max_seq_len:
             raise ValueError(
                 f"Input seq_len={x_t.size(1)} exceeds max_seq_len={self.max_seq_len}."
             )
 
-        x = x_t + self.pos_encoding[:, :x_t.size(1), :] + t_emb.unsqueeze(1)
+        # Positional encoding only — time conditioning is handled exclusively
+        # by FiLM layers in each transformer block, avoiding redundant additive
+        # injection that can interfere with the learned FiLM modulation.
+        x = x_t + self.pos_encoding[:, :x_t.size(1), :]
+        x = self.embed_dropout(x)
         for block in self.transformer:
             x = block(x, t_emb)
         x = self.final_norm(x)
