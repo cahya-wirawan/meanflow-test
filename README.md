@@ -65,6 +65,8 @@ Recommended stable training profile:
 
 ```bash
 python src/train.py \
+	--dataset-split "train[:20%]" \
+	--min-text-chars 32 \
 	--learning-rate 5e-5 \
 	--lr-scheduler plateau \
 	--lr-patience 2 \
@@ -75,6 +77,8 @@ python src/train.py \
 	--ce-weight-start 0.5 \
 	--ce-weight-end 0.5 \
 	--t-sample-power 1.2 \
+	--t-zero-prob 0.2 \
+	--eval-at-t0 \
 	--wandb \
 	--wandb-log-interval 50
 ```
@@ -92,10 +96,12 @@ python src/train.py --wandb --wandb-mode offline
 ```
 
 The training script now also supports:
+- Raw text filtering with `--min-text-chars`
 - Gradient clipping with `--grad-clip-norm`
 - Validation-driven LR scheduling with `--lr-scheduler plateau`
 - Early stopping with `--early-stop-patience` and `--early-stop-min-delta`
 - Time-bias control with `--t-sample-power` (biases training toward $t \approx 0$)
+- Explicit $t=0$ alignment with `--t-zero-prob` and `--eval-at-t0`
 - CE weighting schedule with `--ce-weight-start` and `--ce-weight-end`
 - W&B batch metrics via `--wandb-log-interval`
 - Separate MSE/CE logging for train and validation losses
@@ -130,6 +136,24 @@ python src/inference.py \
 	--seed 42
 ```
 
+For iterative latent refinement, use few-step integration:
+
+```bash
+python src/inference.py \
+	--model-path src/meanflow_language_model.pth \
+	--integration-steps 8 \
+	--integration-method heun \
+	--sample \
+	--temperature 1.0 \
+	--top-k 50 \
+	--seed 42
+```
+
+Supported integration methods:
+- `euler`: first-order, fastest
+- `heun`: second-order predictor-corrector, usually better quality/speed trade-off
+- `rk4`: fourth-order, best accuracy per step but highest compute cost
+
 ### Smoke Test
 
 Run a lightweight end-to-end smoke test (one training batch + one inference pass):
@@ -155,6 +179,12 @@ python src/smoke_test.py
 
 - Symptom: Generation quality is weak at inference time $t=0$.
 	- Try: Bias training toward smaller $t$ with `--t-sample-power 1.2` to `2.0`.
+	- Try: Add explicit $t=0$ supervision with `--t-zero-prob 0.1` to `0.3`.
+	- Try: Evaluate with `--eval-at-t0` for inference-aligned model selection.
+
+- Symptom: Few-step integration is too slow.
+	- Try: Use `--integration-method euler` and fewer `--integration-steps`.
+	- Try: Use `--integration-method heun` as a quality/speed middle ground.
 
 - Symptom: W&B logging fails with import error.
 	- Try: Install W&B with `pip install wandb`.
@@ -173,8 +203,9 @@ python src/smoke_test.py
 | Profile | Use Case | Command |
 | --- | --- | --- |
 | Fast Debug | Quick sanity check on small data with minimal runtime | `python src/train.py --dataset-split "train[:2%]" --epochs 5 --batch-size 8 --seq-len 64 --lr-scheduler none --early-stop-patience 0` |
-| Stable Training | Main training run with anti-instability defaults | `python src/train.py --dataset-split "train[:20%]" --learning-rate 5e-5 --lr-scheduler plateau --lr-patience 2 --lr-factor 0.5 --grad-clip-norm 1.0 --early-stop-patience 8 --early-stop-min-delta 1e-4 --ce-weight-start 0.5 --ce-weight-end 0.5 --t-sample-power 1.2 --wandb --wandb-log-interval 50` |
+| Stable Training | Main training run with anti-instability defaults | `python src/train.py --dataset-split "train[:20%]" --min-text-chars 32 --learning-rate 5e-5 --lr-scheduler plateau --lr-patience 2 --lr-factor 0.5 --grad-clip-norm 1.0 --early-stop-patience 8 --early-stop-min-delta 1e-4 --ce-weight-start 0.5 --ce-weight-end 0.5 --t-sample-power 1.2 --t-zero-prob 0.2 --eval-at-t0 --wandb --wandb-log-interval 50` |
 | Diversity-Focused Inference | Reduce repetitive generation loops with stochastic decoding | `python src/inference.py --model-path src/meanflow_language_model.pth --sample --temperature 1.0 --top-k 50 --seed 42 --num-sequences 5` |
+| Higher-Quality Few-Step Inference | Improve latent refinement quality using second- or fourth-order integration | `python src/inference.py --model-path src/meanflow_language_model.pth --integration-steps 8 --integration-method rk4 --sample --temperature 1.0 --top-k 50 --seed 42` |
 
 ## Loss Functions
 
