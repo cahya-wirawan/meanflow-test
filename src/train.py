@@ -474,7 +474,7 @@ def compute_loss_components(
     vel_diff = (pred_v - target_v) * mask_expanded
     velocity_mse = (vel_diff**2).sum() / (mask.sum() * model.d_model + 1e-6)
 
-    logits = model.lm_logits(pred_x1)
+    logits = model.lm_logits(pred_x1, cosine=False)
     if pad_token_id is None:
         ce_loss = F.cross_entropy(
             logits.view(-1, logits.size(-1)),

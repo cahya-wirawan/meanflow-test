@@ -133,12 +133,21 @@ class MeanFlowLanguageModel(nn.Module):
         sin_emb = sinusoidal_embedding(t, self.d_model)  # [batch, d_model]
         return self.time_embed(sin_emb)  # [batch, d_model]
 
-    def lm_logits(self, hidden_states):
-        # Cosine-similarity logits with bounded learnable temperature.
-        hidden = F.normalize(hidden_states, dim=-1)
-        weight = F.normalize(self.lm_head.weight, dim=-1)
-        scale = self.logit_scale.exp().clamp(min=1.0, max=100.0)
-        return F.linear(hidden, weight) * scale
+    def lm_logits(self, hidden_states, cosine=True):
+        """Compute vocabulary logits from continuous hidden states.
+
+        Args:
+            hidden_states: [batch, seq_len, d_model]
+            cosine: If True, use cosine-similarity logits with learnable
+                temperature (better for generation).  If False, use standard
+                dot-product logits (better for CE training signal).
+        """
+        if cosine:
+            hidden = F.normalize(hidden_states, dim=-1)
+            weight = F.normalize(self.lm_head.weight, dim=-1)
+            scale = self.logit_scale.exp().clamp(min=1.0, max=100.0)
+            return F.linear(hidden, weight) * scale
+        return F.linear(hidden_states, self.lm_head.weight)
 
     def _forward_target(self, x_t, t):
         t_emb = self._get_time_embedding(t)  # [batch, d_model]
@@ -221,7 +230,9 @@ class MeanFlowLanguageModel(nn.Module):
         mse_loss = (diff**2).sum() / (mask.sum() * self.d_model + 1e-6)
         
         # Step G: Auxiliary Classification Loss
-        logits = self.lm_logits(pred_x1)
+        # Use dot-product logits for training to provide stronger CE gradients;
+        # cosine-similarity logits are used at inference time.
+        logits = self.lm_logits(pred_x1, cosine=False)
         if pad_token_id is None:
             ce_loss = F.cross_entropy(
                 logits.view(-1, logits.size(-1)),
