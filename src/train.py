@@ -681,6 +681,7 @@ def main():
             avg_val_loss = total_val_loss / len(val_dataloader)
             avg_val_mse = total_val_mse / len(val_dataloader)
             avg_val_ce = total_val_ce / len(val_dataloader)
+            val_ce_perplexity = math.exp(avg_val_ce)
 
             if scheduler is not None:
                 scheduler.step(avg_val_loss)
@@ -714,6 +715,7 @@ def main():
                         "val_loss": avg_val_loss,
                         "val_mse_loss": avg_val_mse,
                         "val_ce_loss": avg_val_ce,
+                        "val_ce_perplexity": val_ce_perplexity,
                         "best_val_loss": best_val_loss,
                         "checkpoint_saved": int(improved),
                         "ce_weight": ce_weight,
@@ -732,7 +734,7 @@ def main():
                 print(
                     f"Epoch [{epoch + 1}/{args.epochs}] | "
                     f"Train Loss: {avg_train_loss:.4f} (MSE {avg_train_mse:.4f}, CE {avg_train_ce:.4f}) | "
-                    f"Val Loss: {avg_val_loss:.4f} (MSE {avg_val_mse:.4f}, CE {avg_val_ce:.4f}) | "
+                    f"Val Loss: {avg_val_loss:.4f} (MSE {avg_val_mse:.4f}, CE {avg_val_ce:.4f}, PPL {val_ce_perplexity:.2f}) | "
                     f"LR: {current_lr:.2e}"
                 )
 
