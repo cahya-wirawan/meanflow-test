@@ -555,9 +555,9 @@ def main():
             factor=args.lr_factor,
             patience=args.lr_patience,
         )
-    print(sum(p.numel() for p in model.parameters()))
-    print(sum(p.numel() for p in model.parameters() if p.requires_grad))
-    
+    print("Num parameters:", sum(p.numel() for p in model.parameters()))
+    print("Num trainable parameters:", sum(p.numel() for p in model.parameters() if p.requires_grad))
+
     if args.wandb:
         wandb_run = wandb.init(
             project=args.wandb_project,
