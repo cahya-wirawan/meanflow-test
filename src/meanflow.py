@@ -147,7 +147,7 @@ class MeanFlowLanguageModel(nn.Module):
             weight = F.normalize(self.lm_head.weight, dim=-1)
             scale = self.logit_scale.exp().clamp(min=1.0, max=100.0)
             return F.linear(hidden, weight) * scale
-        return F.linear(hidden_states, self.lm_head.weight)
+        return F.linear(hidden_states, self.lm_head.weight) / math.sqrt(self.d_model)
 
     def _forward_target(self, x_t, t):
         t_emb = self._get_time_embedding(t)  # [batch, d_model]
