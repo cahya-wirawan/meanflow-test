@@ -110,6 +110,25 @@ def parse_args():
             "Ignored for deterministic greedy decoding unless stochastic ops are used."
         ),
     )
+    parser.add_argument(
+        "--integration-steps",
+        type=int,
+        default=1,
+        help=(
+            "Number of integration steps from t=0 to t=1. "
+            "Set to 1 for the original one-step jump, or >1 for iterative refinement."
+        ),
+    )
+    parser.add_argument(
+        "--integration-method",
+        type=str,
+        choices=["euler", "heun", "rk4"],
+        default="euler",
+        help=(
+            "Numerical integration method for few-step refinement. "
+            "Heun is a second-order predictor-corrector variant and RK4 is a fourth-order method."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -137,19 +156,96 @@ def generate_text(
     sample=False,
     temperature=1.0,
     top_k=50,
+    integration_steps=1,
+    integration_method="euler",
 ):
     print("\n--- Generating New Text ---")
     model.eval() # Set the model to evaluation mode (turns off dropout, etc.)
     
     with torch.no_grad(): # We don't need gradients for inference
-        predicted_token_ids = model.generate_1_step(
-            batch_size=num_sequences,
-            seq_len=seq_len,
-            device=str(device),
-            sample=sample,
-            temperature=temperature,
-            top_k=top_k,
-        )
+        if integration_steps <= 1:
+            predicted_token_ids = model.generate_1_step(
+                batch_size=num_sequences,
+                seq_len=seq_len,
+                device=str(device),
+                sample=sample,
+                temperature=temperature,
+                top_k=top_k,
+            )
+        else:
+            # Few-step integration using an inferred velocity field.
+            # v_hat(x_t, t) = (pred_x1 - x_t) / (1 - t)
+            x_t = torch.randn(num_sequences, seq_len, model.d_model, device=device)
+            dt = 1.0 / integration_steps
+            t_value = 0.0
+            eps = 1e-4
+
+            for _ in range(integration_steps):
+                t = torch.full((num_sequences, 1), t_value, device=device)
+                pred_x1 = model.forward_net(x_t, t)
+                denom = max(1.0 - t_value, eps)
+                v_hat = (pred_x1 - x_t) / denom
+
+                if integration_method == "heun":
+                    # Predictor step (Euler proposal)
+                    x_pred = x_t + dt * v_hat
+                    t_next_value = min(t_value + dt, 1.0)
+                    t_next = torch.full((num_sequences, 1), t_next_value, device=device)
+
+                    # Corrector velocity at predicted next state
+                    pred_x1_next = model.forward_net(x_pred, t_next)
+                    denom_next = max(1.0 - t_next_value, eps)
+                    v_hat_next = (pred_x1_next - x_pred) / denom_next
+
+                    # Heun update: average current and predicted slopes
+                    x_t = x_t + 0.5 * dt * (v_hat + v_hat_next)
+                elif integration_method == "rk4":
+                    # RK4 update for x' = v(x, t)
+                    k1 = v_hat
+
+                    t2_value = min(t_value + 0.5 * dt, 1.0)
+                    t2 = torch.full((num_sequences, 1), t2_value, device=device)
+                    x2 = x_t + 0.5 * dt * k1
+                    pred_x1_2 = model.forward_net(x2, t2)
+                    denom2 = max(1.0 - t2_value, eps)
+                    k2 = (pred_x1_2 - x2) / denom2
+
+                    x3 = x_t + 0.5 * dt * k2
+                    pred_x1_3 = model.forward_net(x3, t2)
+                    k3 = (pred_x1_3 - x3) / denom2
+
+                    t4_value = min(t_value + dt, 1.0)
+                    t4 = torch.full((num_sequences, 1), t4_value, device=device)
+                    x4 = x_t + dt * k3
+                    pred_x1_4 = model.forward_net(x4, t4)
+                    denom4 = max(1.0 - t4_value, eps)
+                    k4 = (pred_x1_4 - x4) / denom4
+
+                    x_t = x_t + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+                else:
+                    # Euler update
+                    x_t = x_t + dt * v_hat
+
+                t_value += dt
+
+            logits = model.lm_head(x_t)
+            if not sample:
+                predicted_token_ids = torch.argmax(logits, dim=-1)
+            else:
+                logits = logits / temperature
+                if top_k > 0:
+                    k = min(top_k, logits.size(-1))
+                    topk_logits, topk_indices = torch.topk(logits, k=k, dim=-1)
+                    probs = torch.softmax(topk_logits, dim=-1)
+                    sampled = torch.multinomial(probs.reshape(-1, k), num_samples=1)
+                    sampled = sampled.view(num_sequences, seq_len, 1)
+                    predicted_token_ids = topk_indices.gather(-1, sampled).squeeze(-1)
+                else:
+                    probs = torch.softmax(logits, dim=-1)
+                    sampled = torch.multinomial(
+                        probs.reshape(-1, probs.size(-1)), num_samples=1
+                    )
+                    predicted_token_ids = sampled.view(num_sequences, seq_len)
 
         # Decode the token IDs back into readable English strings
         for i in range(num_sequences):
@@ -170,6 +266,8 @@ if __name__ == "__main__":
         raise ValueError("--temperature must be > 0")
     if args.top_k < 0:
         raise ValueError("--top-k must be >= 0")
+    if args.integration_steps <= 0:
+        raise ValueError("--integration-steps must be > 0")
 
     if args.seed is not None:
         torch.manual_seed(args.seed)
@@ -210,4 +308,6 @@ if __name__ == "__main__":
         sample=args.sample,
         temperature=args.temperature,
         top_k=args.top_k,
+        integration_steps=args.integration_steps,
+        integration_method=args.integration_method,
     )
