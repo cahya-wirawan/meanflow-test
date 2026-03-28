@@ -733,7 +733,7 @@ def main():
                         ce_weight=ce_weight,
                         t_sample_power=args.t_sample_power,
                         t_zero_prob=0.0,
-                        eval_at_t0=args.eval_at_t0,
+                        eval_at_t0=False,
                         velocity_loss_weight=args.velocity_loss_weight,
                     )
                     total_val_loss += val_loss.item()
