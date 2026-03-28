@@ -232,18 +232,19 @@ class MeanFlowLanguageModel(nn.Module):
         # Step G: Auxiliary Classification Loss
         # Use dot-product logits for training to provide stronger CE gradients;
         # cosine-similarity logits are used at inference time.
+        # Weight CE per-sample by t^2: high-t predictions are accurate and give
+        # meaningful gradients; low-t predictions are near-random noise.
         logits = self.lm_logits(pred_x1, cosine=False)
-        if pad_token_id is None:
-            ce_loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                input_ids.view(-1),
-            )
-        else:
-            ce_loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                input_ids.view(-1),
-                ignore_index=pad_token_id,
-            )
+        ce_weights = (t ** 2).expand_as(input_ids).reshape(-1)
+        if pad_token_id is not None:
+            pad_mask = (input_ids != pad_token_id).float().reshape(-1)
+            ce_weights = ce_weights * pad_mask
+        per_token_ce = F.cross_entropy(
+            logits.view(-1, logits.size(-1)),
+            input_ids.view(-1),
+            reduction='none',
+        )
+        ce_loss = (per_token_ce * ce_weights).sum() / ce_weights.sum().clamp_min(1e-6)
         
         # Combine the losses with configurable CE weighting.
         return mse_loss + ce_weight * ce_loss

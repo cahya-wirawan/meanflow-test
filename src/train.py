@@ -475,17 +475,21 @@ def compute_loss_components(
     velocity_mse = (vel_diff**2).sum() / (mask.sum() * model.d_model + 1e-6)
 
     logits = model.lm_logits(pred_x1, cosine=False)
-    if pad_token_id is None:
-        ce_loss = F.cross_entropy(
-            logits.view(-1, logits.size(-1)),
-            input_ids.view(-1),
-        )
-    else:
-        ce_loss = F.cross_entropy(
-            logits.view(-1, logits.size(-1)),
-            input_ids.view(-1),
-            ignore_index=pad_token_id,
-        )
+    # Weight CE per-sample by t^2: predictions from high-t samples (x_t ≈ x_1)
+    # are accurate and give meaningful CE gradients, while low-t samples
+    # (x_t ≈ noise) produce near-random pred_x1 that would dominate CE with
+    # uninformative gradients.  t=0 forced samples still contribute via MSE.
+    # t: [batch, 1] -> ce_weights: [batch, seq_len]
+    ce_weights = (t ** 2).expand_as(input_ids).reshape(-1)  # [batch * seq_len]
+    if pad_token_id is not None:
+        pad_mask = (input_ids != pad_token_id).float().reshape(-1)
+        ce_weights = ce_weights * pad_mask
+    per_token_ce = F.cross_entropy(
+        logits.view(-1, logits.size(-1)),
+        input_ids.view(-1),
+        reduction='none',
+    )
+    ce_loss = (per_token_ce * ce_weights).sum() / ce_weights.sum().clamp_min(1e-6)
 
     if getattr(model, "prediction_target", "x1") == "v":
         flow_loss = mse_loss + velocity_loss_weight * velocity_mse
