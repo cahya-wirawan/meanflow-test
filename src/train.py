@@ -198,6 +198,15 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--velocity-loss-weight",
+        type=float,
+        default=0.25,
+        help=(
+            "Weight applied to velocity MSE when --prediction-target v. "
+            "Total flow loss becomes x1_mse + velocity_loss_weight * velocity_mse."
+        ),
+    )
+    parser.add_argument(
         "--diagnostic-samples",
         type=int,
         default=4,
@@ -370,6 +379,8 @@ def validate_args(args):
         raise ValueError("--t-zero-prob must be between 0 and 1")
     if args.ce_weight_start < 0 or args.ce_weight_end < 0:
         raise ValueError("--ce-weight-start and --ce-weight-end must be >= 0")
+    if args.velocity_loss_weight < 0:
+        raise ValueError("--velocity-loss-weight must be >= 0")
     if args.diagnostic_samples <= 0:
         raise ValueError("--diagnostic-samples must be > 0")
     if args.diagnostic_temperature <= 0:
@@ -423,6 +434,7 @@ def compute_loss_components(
     t_sample_power=1.0,
     t_zero_prob=0.0,
     eval_at_t0=False,
+    velocity_loss_weight=0.25,
 ):
     batch_size, _ = input_ids.shape
 
@@ -449,9 +461,9 @@ def compute_loss_components(
         # For linear bridges x_t = t*x1 + (1-t)*x0, the true velocity is constant: v = x1 - x0.
         target_v = x_1 - x_0
         pred_v = model.predict_velocity(x_t, t)
-        diff = (pred_v - target_v) * mask_expanded
-        mse_loss = (diff**2).sum() / (mask.sum() * model.d_model + 1e-6)
         pred_x1 = x_t + (1 - t_expanded) * pred_v
+        x1_diff = (pred_x1 - x_1) * mask_expanded
+        mse_loss = (x1_diff**2).sum() / (mask.sum() * model.d_model + 1e-6)
     else:
         pred_x1 = model.forward_net(x_t, t)
         diff = (pred_x1 - x_1) * mask_expanded
@@ -475,7 +487,12 @@ def compute_loss_components(
             ignore_index=pad_token_id,
         )
 
-    total_loss = mse_loss + ce_weight * ce_loss
+    if getattr(model, "prediction_target", "x1") == "v":
+        flow_loss = mse_loss + velocity_loss_weight * velocity_mse
+    else:
+        flow_loss = mse_loss
+
+    total_loss = flow_loss + ce_weight * ce_loss
     return total_loss, mse_loss, ce_loss, velocity_mse
 
 def main():
@@ -610,6 +627,7 @@ def main():
                 "eval_at_t0": args.eval_at_t0,
                 "ce_weight_start": args.ce_weight_start,
                 "ce_weight_end": args.ce_weight_end,
+                "velocity_loss_weight": args.velocity_loss_weight,
                 "diagnostic_samples": args.diagnostic_samples,
                 "diagnostic_temperature": args.diagnostic_temperature,
                 "diagnostic_top_k": args.diagnostic_top_k,
@@ -657,6 +675,7 @@ def main():
                     t_sample_power=args.t_sample_power,
                     t_zero_prob=args.t_zero_prob,
                     eval_at_t0=False,
+                    velocity_loss_weight=args.velocity_loss_weight,
                 )
                 loss.backward()
                 if args.grad_clip_norm > 0:
@@ -706,6 +725,7 @@ def main():
                         t_sample_power=args.t_sample_power,
                         t_zero_prob=0.0,
                         eval_at_t0=args.eval_at_t0,
+                        velocity_loss_weight=args.velocity_loss_weight,
                     )
                     total_val_loss += val_loss.item()
                     total_val_mse += val_mse.item()

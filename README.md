@@ -83,6 +83,31 @@ python src/train.py \
 	--wandb-log-interval 50
 ```
 
+Recommended v-mode config:
+
+```bash
+python src/train.py \
+	--dataset-split "train[:100%]" \
+	--min-text-chars 32 \
+	--learning-rate 5e-5 \
+	--lr-scheduler plateau \
+	--lr-patience 2 \
+	--lr-factor 0.5 \
+	--grad-clip-norm 1.0 \
+	--early-stop-patience 8 \
+	--ce-weight-start 0.3 \
+	--ce-weight-end 1.0 \
+	--prediction-target v \
+	--velocity-loss-weight 0.25 \
+	--t-sample-power 1.2 \
+	--t-zero-prob 0.4 \
+	--eval-at-t0 \
+	--batch-size 16 \
+	--seq-len 1024 \
+	--wandb \
+	--wandb-log-interval 50
+```
+
 Enable W&B logging during training:
 
 ```bash
