@@ -133,21 +133,21 @@ class MeanFlowLanguageModel(nn.Module):
         sin_emb = sinusoidal_embedding(t, self.d_model)  # [batch, d_model]
         return self.time_embed(sin_emb)  # [batch, d_model]
 
-    def lm_logits(self, hidden_states, cosine=True):
+    def lm_logits(self, hidden_states):
         """Compute vocabulary logits from continuous hidden states.
+
+        Uses cosine-similarity logits with a learnable temperature scale.
+        Normalizing both hidden states and embedding weights removes
+        dependence on vector norms, giving well-scaled logits that
+        produce meaningful CE gradients regardless of embedding magnitude.
 
         Args:
             hidden_states: [batch, seq_len, d_model]
-            cosine: If True, use cosine-similarity logits with learnable
-                temperature (better for generation).  If False, use standard
-                dot-product logits (better for CE training signal).
         """
-        if cosine:
-            hidden = F.normalize(hidden_states, dim=-1)
-            weight = F.normalize(self.lm_head.weight, dim=-1)
-            scale = self.logit_scale.exp().clamp(min=1.0, max=100.0)
-            return F.linear(hidden, weight) * scale
-        return F.linear(hidden_states, self.lm_head.weight)
+        hidden = F.normalize(hidden_states, dim=-1)
+        weight = F.normalize(self.lm_head.weight, dim=-1)
+        scale = self.logit_scale.exp().clamp(min=1.0, max=100.0)
+        return F.linear(hidden, weight) * scale
 
     def _forward_target(self, x_t, t):
         t_emb = self._get_time_embedding(t)  # [batch, d_model]
@@ -234,7 +234,7 @@ class MeanFlowLanguageModel(nn.Module):
         # cosine-similarity logits are used at inference time.
         # Weight CE per-sample by t^2: high-t predictions are accurate and give
         # meaningful gradients; low-t predictions are near-random noise.
-        logits = self.lm_logits(pred_x1, cosine=False)
+        logits = self.lm_logits(pred_x1)
         ce_weights = (t ** 2).expand_as(input_ids).reshape(-1)
         if pad_token_id is not None:
             pad_mask = (input_ids != pad_token_id).float().reshape(-1)

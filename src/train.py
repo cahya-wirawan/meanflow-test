@@ -474,7 +474,7 @@ def compute_loss_components(
     vel_diff = (pred_v - target_v) * mask_expanded
     velocity_mse = (vel_diff**2).sum() / (mask.sum() * model.d_model + 1e-6)
 
-    logits = model.lm_logits(pred_x1, cosine=False)
+    logits = model.lm_logits(pred_x1)
     # Weight CE per-sample by t^2: predictions from high-t samples (x_t ≈ x_1)
     # are accurate and give meaningful CE gradients, while low-t samples
     # (x_t ≈ noise) produce near-random pred_x1 that would dominate CE with
@@ -770,16 +770,17 @@ def main():
             else:
                 epochs_without_improvement += 1
 
+            diagnostic_tokens = model.generate_1_step(
+                batch_size=args.diagnostic_samples,
+                seq_len=args.seq_len,
+                device=str(device),
+                sample=True,
+                temperature=args.diagnostic_temperature,
+                top_k=args.diagnostic_top_k,
+            )
+            diversity = compute_diversity_metrics(diagnostic_tokens, vocab_size=vocab_size)
+
             if wandb_run is not None:
-                diagnostic_tokens = model.generate_1_step(
-                    batch_size=args.diagnostic_samples,
-                    seq_len=args.seq_len,
-                    device=str(device),
-                    sample=True,
-                    temperature=args.diagnostic_temperature,
-                    top_k=args.diagnostic_top_k,
-                )
-                diversity = compute_diversity_metrics(diagnostic_tokens, vocab_size=vocab_size)
                 wandb_run.log(
                     {
                         "epoch": epoch + 1,
@@ -815,6 +816,18 @@ def main():
                     f"(MSE {avg_val_mse:.4f}, CE {avg_val_ce:.4f}, VelMSE {avg_val_velocity_mse:.4f}, PPL {val_ce_perplexity:.2f}) | "
                     f"LR: {current_lr:.2e}"
                 )
+                print(
+                    f"  Diversity: distinct_1={diversity['distinct_1']:.3f} "
+                    f"distinct_2={diversity['distinct_2']:.3f} "
+                    f"entropy_norm={diversity['token_entropy_norm']:.3f}"
+                )
+                print("  --- Generated samples ---")
+                for i in range(min(2, diagnostic_tokens.size(0))):
+                    sample_text = tokenizer.decode(
+                        diagnostic_tokens[i].tolist(), skip_special_tokens=True
+                    )
+                    print(f"  [{i+1}] {sample_text[:200]}")
+                print("  -------------------------")
 
             if (
                 args.early_stop_patience > 0
