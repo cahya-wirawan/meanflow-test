@@ -258,8 +258,12 @@ def generate_text(
         if local_to_orig is not None:
             predicted_token_ids = local_to_orig[predicted_token_ids.cpu()]
 
+        eos_id = tokenizer.eos_token_id
         for i in range(num_sequences):
             token_ids = predicted_token_ids[i].tolist()
+            # Truncate at first EOS so padding tokens don't bleed into the next sentence.
+            if eos_id in token_ids:
+                token_ids = token_ids[:token_ids.index(eos_id)]
             generated_text = tokenizer.decode(token_ids, skip_special_tokens=True)
             print(f"Sequence {i+1}: {generated_text}")
 

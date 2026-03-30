@@ -486,7 +486,14 @@ def generate_samples(model, tokenizer, num_sequences, seq_len, device, integrati
     # Remap local indices → original GPT-2 token IDs before decoding.
     if local_to_orig is not None:
         tokens = local_to_orig[tokens.cpu()]
-    return [tokenizer.decode(tokens[i].tolist(), skip_special_tokens=True) for i in range(num_sequences)]
+    eos_id = tokenizer.eos_token_id
+    results = []
+    for i in range(num_sequences):
+        token_ids = tokens[i].tolist()
+        if eos_id in token_ids:
+            token_ids = token_ids[:token_ids.index(eos_id)]
+        results.append(tokenizer.decode(token_ids, skip_special_tokens=True))
+    return results
 
 
 def compute_loss_components(
