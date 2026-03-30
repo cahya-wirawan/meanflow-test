@@ -7,6 +7,7 @@ import random
 from typing import Any
 import argparse
 import math
+from tiny_dataset import make_template_dataset
 
 SEQ_LEN = 128
 BATCH_SIZE = 16
@@ -573,7 +574,8 @@ def main():
     print(f"Real Vocabulary Size: {vocab_size}")
 
     print("Downloading/Loading Dataset...")
-    raw_dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split=args.dataset_split)
+    # raw_dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split=args.dataset_split)
+    raw_dataset = make_template_dataset(n=5000, seed=args.seed)
     raw_dataset = raw_dataset.filter(lambda x: len(x["text"].strip()) >= args.min_text_chars)
     split_dataset = raw_dataset.train_test_split(test_size=args.val_ratio, seed=args.seed)
 
