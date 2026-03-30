@@ -266,6 +266,11 @@ if __name__ == "__main__":
         raise ValueError("--top-k must be >= 0")
     if args.integration_steps <= 0:
         raise ValueError("--integration-steps must be > 0")
+    if args.integration_steps == 1 and args.integration_method != "euler":
+        print(
+            f"Warning: --integration-method {args.integration_method!r} has no effect "
+            "when --integration-steps 1 (default). Use --integration-steps N with N > 1."
+        )
 
     if args.seed is not None:
         torch.manual_seed(args.seed)
@@ -286,23 +291,45 @@ if __name__ == "__main__":
     vocab_size = len(tokenizer)
     print(f"Real Vocabulary Size: {vocab_size}")
 
+    checkpoint = torch.load(args.model_path, map_location=device, weights_only=True)
+
+    # Support both old (state_dict only) and new (dict with config) checkpoint formats.
+    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+        cfg = checkpoint["model_config"]
+        print(
+            f"Loaded checkpoint config: d_model={cfg['d_model']} num_heads={cfg['num_heads']} "
+            f"num_layers={cfg['num_layers']} max_seq_len={cfg['max_seq_len']} "
+            f"prediction_target={cfg['prediction_target']}"
+        )
+        # CLI args override checkpoint config if explicitly provided, otherwise use checkpoint values.
+        d_model = args.d_model if args.d_model != 128 else cfg["d_model"]
+        num_heads = args.num_heads if args.num_heads != 4 else cfg["num_heads"]
+        num_layers = args.num_layers if args.num_layers != 4 else cfg["num_layers"]
+        max_seq_len = args.seq_len if args.seq_len != SEQ_LEN else cfg["max_seq_len"]
+        prediction_target = cfg["prediction_target"]
+        state_dict = checkpoint["model_state_dict"]
+    else:
+        d_model, num_heads, num_layers = args.d_model, args.num_heads, args.num_layers
+        max_seq_len = args.seq_len
+        prediction_target = args.prediction_target
+        state_dict = checkpoint
+
     model = MeanFlowLanguageModel(
         vocab_size=vocab_size,
-        d_model=args.d_model,
-        num_heads=args.num_heads,
-        num_layers=args.num_layers,
-        max_seq_len=args.seq_len,
-        prediction_target=args.prediction_target,
+        d_model=d_model,
+        num_heads=num_heads,
+        num_layers=num_layers,
+        max_seq_len=max_seq_len,
+        prediction_target=prediction_target,
     ).to(device)
 
-    # Load the trained model weights (if you have them saved)
-    model.load_state_dict(torch.load(args.model_path, map_location=device, weights_only=True))
+    model.load_state_dict(state_dict)
 
     generate_text(
         model,
         tokenizer,
         num_sequences=args.num_sequences,
-        seq_len=args.seq_len,
+        seq_len=max_seq_len,
         device=str(device),
         sample=args.sample,
         temperature=args.temperature,
