@@ -70,11 +70,15 @@ class MeanFlowLanguageModel(nn.Module):
         )
         self.final_norm = nn.LayerNorm(d_model)
         
-        # Neural network needs to know "where" it is in the flow time [0, 1]
+        # Sinusoidal time embedding: gives the network a rich Fourier basis over [0,1]
+        # rather than a single scalar that linear layers struggle to extrapolate from.
+        half = d_model // 2
+        freqs = torch.exp(-math.log(10000) * torch.arange(half, dtype=torch.float) / half)
+        self.register_buffer("time_freqs", freqs)  # [half]
         self.time_embed = nn.Sequential(
-            nn.Linear(1, d_model),
+            nn.Linear(d_model, d_model),
             nn.SiLU(),
-            nn.Linear(d_model, d_model)
+            nn.Linear(d_model, d_model),
         )
         
         # 3. Output Head (Predicts the continuous vector)
@@ -94,8 +98,14 @@ class MeanFlowLanguageModel(nn.Module):
         scale = self.logit_scale.exp().clamp(min=1.0, max=100.0)
         return F.linear(hidden, weight) * scale
 
+    def _sinusoidal_t_emb(self, t):
+        # t: [batch, 1] → [batch, d_model] via sin/cos Fourier features
+        args = t * self.time_freqs.unsqueeze(0)  # [batch, half]
+        fourier = torch.cat([args.sin(), args.cos()], dim=-1)  # [batch, d_model]
+        return self.time_embed(fourier)
+
     def _forward_target(self, x_t, t):
-        t_emb = self.time_embed(t)  # [batch, d_model]
+        t_emb = self._sinusoidal_t_emb(t)  # [batch, d_model]
 
         if x_t.size(1) > self.max_seq_len:
             raise ValueError(
