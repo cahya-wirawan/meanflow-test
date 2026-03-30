@@ -445,8 +445,8 @@ def compute_diversity_metrics(tokens, vocab_size):
     }
 
 
-def generate_samples(model, tokenizer, num_sequences, seq_len, device, integration_steps, temperature, top_k):
-    """Generate text via Heun integration and decode to strings."""
+def generate_samples(model, tokenizer, num_sequences, seq_len, device, integration_steps, temperature, top_k, local_to_orig=None):
+    """Generate text via x0-anchored multi-step integration and decode to strings."""
     model.eval()
     with torch.no_grad():
         x_0 = torch.randn(num_sequences, seq_len, model.d_model, device=device)
@@ -474,6 +474,9 @@ def generate_samples(model, tokenizer, num_sequences, seq_len, device, integrati
             probs = torch.softmax(logits, dim=-1)
             tokens = torch.multinomial(probs.reshape(-1, probs.size(-1)), num_samples=1).view(num_sequences, seq_len)
 
+    # Remap local indices → original GPT-2 token IDs before decoding.
+    if local_to_orig is not None:
+        tokens = local_to_orig[tokens.cpu()]
     return [tokenizer.decode(tokens[i].tolist(), skip_special_tokens=True) for i in range(num_sequences)]
 
 
@@ -614,6 +617,40 @@ def main():
     lm_datasets.set_format(type="torch", columns=["input_ids"])
     train_dataset: Any = lm_datasets["train"]
     val_dataset: Any = lm_datasets["test"]
+
+    # Build a restricted vocabulary from tokens that actually appear in the dataset.
+    # This prevents the model from generating tokens outside the training distribution,
+    # which otherwise happens because unused embeddings drift freely during training.
+    all_ids: set = set()
+    for batch in train_dataset:
+        all_ids.update(batch["input_ids"].tolist())
+    for batch in val_dataset:
+        all_ids.update(batch["input_ids"].tolist())
+    token_ids_used = sorted(all_ids)
+    restricted_vocab_size = len(token_ids_used)
+    # Map original token IDs → contiguous indices [0, restricted_vocab_size)
+    orig_to_local = {orig: local for local, orig in enumerate(token_ids_used)}
+    local_to_orig = torch.tensor(token_ids_used, dtype=torch.long)
+
+    def remap_ids(batch):
+        batch["input_ids"] = torch.tensor(
+            [orig_to_local[t.item()] for t in batch["input_ids"]], dtype=torch.long
+        )
+        return batch
+
+    if restricted_vocab_size < len(tokenizer):
+        print(
+            f"Restricting vocabulary: {len(tokenizer)} → {restricted_vocab_size} tokens "
+            f"(tokens actually present in dataset)"
+        )
+        train_dataset = train_dataset.map(remap_ids)
+        val_dataset = val_dataset.map(remap_ids)
+        lm_datasets.set_format(type="torch", columns=["input_ids"])
+        effective_vocab_size = restricted_vocab_size
+    else:
+        effective_vocab_size = len(tokenizer)
+        local_to_orig = None
+
     if len(train_dataset) == 0 or len(val_dataset) == 0:
         raise ValueError(
             "Train/val dataset is empty after grouping. Try a larger --dataset-split or lower --seq-len."
@@ -628,7 +665,7 @@ def main():
     )
 
     model = MeanFlowLanguageModel(
-        vocab_size=vocab_size,
+        vocab_size=effective_vocab_size,
         d_model=args.d_model,
         num_heads=args.num_heads,
         num_layers=args.num_layers,
@@ -799,7 +836,7 @@ def main():
                     {
                         "model_state_dict": model.state_dict(),
                         "model_config": {
-                            "vocab_size": vocab_size,
+                            "vocab_size": effective_vocab_size,
                             "d_model": args.d_model,
                             "num_heads": args.num_heads,
                             "num_layers": args.num_layers,
@@ -822,7 +859,10 @@ def main():
                     temperature=args.diagnostic_temperature,
                     top_k=args.diagnostic_top_k,
                 )
-                diversity = compute_diversity_metrics(diagnostic_tokens, vocab_size=vocab_size)
+                # Remap local indices back to original token IDs for diversity metrics.
+                if local_to_orig is not None:
+                    diagnostic_tokens = local_to_orig[diagnostic_tokens.cpu()].to(device)
+                diversity = compute_diversity_metrics(diagnostic_tokens, vocab_size=effective_vocab_size)
                 wandb_run.log(
                     {
                         "epoch": epoch + 1,
@@ -868,6 +908,7 @@ def main():
                     integration_steps=args.sample_steps,
                     temperature=args.diagnostic_temperature,
                     top_k=args.diagnostic_top_k,
+                    local_to_orig=local_to_orig,
                 )
                 print(f"\n--- Generated samples (epoch {epoch + 1}, {args.sample_steps}-step Heun) ---")
                 for i, text in enumerate(samples):
