@@ -1,5 +1,5 @@
 import random
-from datasets import Dataset
+from datasets import Dataset, load_dataset
 
 
 def make_template_dataset(n=5000, seed=42):
@@ -16,3 +16,10 @@ def make_template_dataset(n=5000, seed=42):
         for _ in range(n)
     ]
     return Dataset.from_dict({"text": sentences})
+
+def slni_dataset(n=5000):
+    raw_dataset = load_dataset("snli", split=f"train[:{n}]")
+    raw_dataset = raw_dataset.filter(lambda x: x["hypothesis"] != "" and len(x["hypothesis"].split()) <= 12)
+    raw_dataset = raw_dataset.rename_column("hypothesis", "text")
+    raw_dataset = raw_dataset.remove_columns([c for c in raw_dataset.column_names if c != "text"])
+    return raw_dataset
