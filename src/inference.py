@@ -182,50 +182,59 @@ def generate_text(
                 top_k=top_k,
             )
         else:
-            # Few-step integration using model velocity predictions.
-            x_t = torch.randn(num_sequences, seq_len, model.d_model, device=device)
+            # Few-step refinement using x0-anchored update (DDIM-style).
+            # At each step: pred_x1 = forward_net(x_t, t)
+            #               x_{t+dt} = (t+dt)*pred_x1 + (1-t-dt)*x_0
+            # This avoids the 1/(1-t) velocity singularity entirely and does not
+            # amplify prediction errors as t approaches 1. Heun/RK4 options are
+            # kept for v-prediction models where they are numerically stable.
+            x_0 = torch.randn(num_sequences, seq_len, model.d_model, device=device)
+            x_t = x_0.clone()
             dt = 1.0 / integration_steps
             t_value = 0.0
 
-            for _ in range(integration_steps):
+            for step_idx in range(integration_steps):
                 t = torch.full((num_sequences, 1), t_value, device=device)
-                v_hat = model.predict_velocity(x_t, t)
+                t_next_value = min(t_value + dt, 1.0)
 
-                t_next_value = t_value + dt
-                is_last_step = t_next_value >= 1.0 - 1e-6
-
-                if integration_method == "heun" and not is_last_step:
-                    # Predictor step (Euler proposal)
-                    x_pred = x_t + dt * v_hat
-                    t_next = torch.full((num_sequences, 1), t_next_value, device=device)
-                    # Corrector velocity at predicted next state
-                    v_hat_next = model.predict_velocity(x_pred, t_next)
-                    # Heun update: average current and predicted slopes
-                    x_t = x_t + 0.5 * dt * (v_hat + v_hat_next)
-                elif integration_method == "rk4" and not is_last_step:
-                    # RK4 update for x' = v(x, t)
-                    k1 = v_hat
-
-                    t2_value = t_value + 0.5 * dt
-                    t2 = torch.full((num_sequences, 1), t2_value, device=device)
-                    x2 = x_t + 0.5 * dt * k1
-                    k2 = model.predict_velocity(x2, t2)
-
-                    x3 = x_t + 0.5 * dt * k2
-                    k3 = model.predict_velocity(x3, t2)
-
-                    t4 = torch.full((num_sequences, 1), t_next_value, device=device)
-                    x4 = x_t + dt * k3
-                    k4 = model.predict_velocity(x4, t4)
-
-                    x_t = x_t + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+                if model.prediction_target == "x1":
+                    # x0-anchored: directly interpolate between x_0 and pred_x1.
+                    pred_x1 = model.forward_net(x_t, t)
+                    t_next_exp = t_next_value  # scalar
+                    x_t = t_next_exp * pred_x1 + (1.0 - t_next_exp) * x_0
                 else:
-                    # Euler update (also used as fallback for last step to avoid t=1 singularity)
-                    x_t = x_t + dt * v_hat
+                    # Velocity integration (v-prediction models).
+                    v_hat = model.predict_velocity(x_t, t)
+                    is_last_step = t_next_value >= 1.0 - 1e-6
 
-                t_value += dt
+                    if integration_method == "heun" and not is_last_step:
+                        x_pred = x_t + dt * v_hat
+                        t_next = torch.full((num_sequences, 1), t_next_value, device=device)
+                        v_hat_next = model.predict_velocity(x_pred, t_next)
+                        x_t = x_t + 0.5 * dt * (v_hat + v_hat_next)
+                    elif integration_method == "rk4" and not is_last_step:
+                        k1 = v_hat
+                        t2_value = t_value + 0.5 * dt
+                        t2 = torch.full((num_sequences, 1), t2_value, device=device)
+                        x2 = x_t + 0.5 * dt * k1
+                        k2 = model.predict_velocity(x2, t2)
+                        x3 = x_t + 0.5 * dt * k2
+                        k3 = model.predict_velocity(x3, t2)
+                        t4 = torch.full((num_sequences, 1), t_next_value, device=device)
+                        x4 = x_t + dt * k3
+                        k4 = model.predict_velocity(x4, t4)
+                        x_t = x_t + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+                    else:
+                        x_t = x_t + dt * v_hat
 
-            logits = model.lm_logits(x_t)
+                t_value = t_next_value
+
+            # Read logits from pred_x1 for x1-mode (already the model's best estimate),
+            # or from x_t for v-mode (integrated to t≈1).
+            if model.prediction_target == "x1":
+                logits = model.lm_logits(pred_x1)
+            else:
+                logits = model.lm_logits(x_t)
             if not sample:
                 predicted_token_ids = torch.argmax(logits, dim=-1)
             else:

@@ -448,24 +448,21 @@ def generate_samples(model, tokenizer, num_sequences, seq_len, device, integrati
     """Generate text via Heun integration and decode to strings."""
     model.eval()
     with torch.no_grad():
-        x_t = torch.randn(num_sequences, seq_len, model.d_model, device=device)
+        x_0 = torch.randn(num_sequences, seq_len, model.d_model, device=device)
+        x_t = x_0.clone()
         dt = 1.0 / integration_steps
         t_val = 0.0
+        pred_x1 = x_t  # fallback if integration_steps == 0
         for _ in range(integration_steps):
             t = torch.full((num_sequences, 1), t_val, device=device)
-            v = model.predict_velocity(x_t, t)
-            t_next_val = t_val + dt
-            if t_next_val >= 1.0 - 1e-6:
-                # Last step: Euler only — querying velocity at t=1 causes 1/(1-t) singularity.
-                x_t = x_t + dt * v
-            else:
-                x_pred = x_t + dt * v
-                t_next = torch.full((num_sequences, 1), t_next_val, device=device)
-                v_next = model.predict_velocity(x_pred, t_next)
-                x_t = x_t + 0.5 * dt * (v + v_next)
-            t_val += dt
+            t_next_val = min(t_val + dt, 1.0)
+            # x0-anchored update: place x_t directly on the line between x_0 and pred_x1.
+            # Avoids the 1/(1-t) singularity that corrupts velocity-based integration.
+            pred_x1 = model.forward_net(x_t, t)
+            x_t = t_next_val * pred_x1 + (1.0 - t_next_val) * x_0
+            t_val = t_next_val
 
-        logits = model.lm_logits(x_t) / max(temperature, 1e-6)
+        logits = model.lm_logits(pred_x1) / max(temperature, 1e-6)
         if top_k > 0:
             k = min(top_k, logits.size(-1))
             topk_logits, topk_indices = torch.topk(logits, k=k, dim=-1)
