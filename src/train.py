@@ -532,15 +532,19 @@ def compute_loss_components(
         target_v = x_1 - x_0
         pred_v = model.predict_velocity(x_t, t)
         pred_x1 = x_t + (1 - t_expanded) * pred_v
-        x1_diff = (pred_x1 - x_1) * mask_expanded
-        mse_loss = (x1_diff**2).sum() / (mask.sum() * model.d_model + 1e-6)
+        x1_diff = pred_x1 - x_1
+        # MSE over ALL positions (including pad): model must learn to predict pad embedding at
+        # pad positions so it outputs EOS at inference instead of random content tokens.
+        mse_loss = (x1_diff**2).sum() / (batch_size * x_1.size(1) * model.d_model)
         vel_diff = (pred_v - target_v) * mask_expanded
         velocity_mse = (vel_diff**2).sum() / (mask.sum() * model.d_model + 1e-6)
         flow_loss = mse_loss + velocity_loss_weight * velocity_mse
     else:
         pred_x1 = model.forward_net(x_t, t)
-        diff = (pred_x1 - x_1) * mask_expanded
-        mse_loss = (diff**2).sum() / (mask.sum() * model.d_model + 1e-6)
+        diff = pred_x1 - x_1
+        # MSE over ALL positions (including pad): model must learn to predict pad embedding at
+        # pad positions so it outputs EOS at inference instead of random content tokens.
+        mse_loss = (diff**2).sum() / (batch_size * x_1.size(1) * model.d_model)
         velocity_mse = torch.tensor(0.0, device=x_1.device)
         flow_loss = mse_loss
 
