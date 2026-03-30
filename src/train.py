@@ -7,7 +7,7 @@ import random
 from typing import Any
 import argparse
 import math
-from tiny_dataset import make_template_dataset, slni_dataset
+from tiny_dataset import make_template_dataset, snli_dataset
 
 SEQ_LEN = 128
 BATCH_SIZE = 16
@@ -598,7 +598,7 @@ def main():
 
     print("Downloading/Loading Dataset...")
     # raw_dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split=args.dataset_split)
-    raw_dataset = slni_dataset(n=5000)
+    raw_dataset = snli_dataset(split=args.dataset_split)
     raw_dataset = raw_dataset.filter(lambda x: len(x["text"].strip()) >= args.min_text_chars)
     split_dataset = raw_dataset.train_test_split(test_size=args.val_ratio, seed=args.seed)
 
