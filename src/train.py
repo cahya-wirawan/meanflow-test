@@ -234,6 +234,24 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--sample-interval",
+        type=int,
+        default=10,
+        help=(
+            "Print generated text samples every N epochs using multi-step inference. "
+            "Set to 0 to disable."
+        ),
+    )
+    parser.add_argument(
+        "--sample-steps",
+        type=int,
+        default=20,
+        help=(
+            "Number of integration steps for epoch-level text sampling. "
+            "More steps generally produce more coherent text."
+        ),
+    )
+    parser.add_argument(
         "--wandb",
         action="store_true",
         help=(
@@ -424,6 +442,41 @@ def compute_diversity_metrics(tokens, vocab_size):
         "token_entropy": float(entropy),
         "token_entropy_norm": float(norm_entropy),
     }
+
+
+def generate_samples(model, tokenizer, num_sequences, seq_len, device, integration_steps, temperature, top_k):
+    """Generate text via Heun integration and decode to strings."""
+    model.eval()
+    with torch.no_grad():
+        x_t = torch.randn(num_sequences, seq_len, model.d_model, device=device)
+        dt = 1.0 / integration_steps
+        t_val = 0.0
+        for _ in range(integration_steps):
+            t = torch.full((num_sequences, 1), t_val, device=device)
+            v = model.predict_velocity(x_t, t)
+            t_next_val = t_val + dt
+            if t_next_val >= 1.0 - 1e-6:
+                # Last step: Euler only — querying velocity at t=1 causes 1/(1-t) singularity.
+                x_t = x_t + dt * v
+            else:
+                x_pred = x_t + dt * v
+                t_next = torch.full((num_sequences, 1), t_next_val, device=device)
+                v_next = model.predict_velocity(x_pred, t_next)
+                x_t = x_t + 0.5 * dt * (v + v_next)
+            t_val += dt
+
+        logits = model.lm_logits(x_t) / max(temperature, 1e-6)
+        if top_k > 0:
+            k = min(top_k, logits.size(-1))
+            topk_logits, topk_indices = torch.topk(logits, k=k, dim=-1)
+            probs = torch.softmax(topk_logits, dim=-1)
+            sampled = torch.multinomial(probs.reshape(-1, k), num_samples=1)
+            tokens = topk_indices.gather(-1, sampled.view(num_sequences, seq_len, 1)).squeeze(-1)
+        else:
+            probs = torch.softmax(logits, dim=-1)
+            tokens = torch.multinomial(probs.reshape(-1, probs.size(-1)), num_samples=1).view(num_sequences, seq_len)
+
+    return [tokenizer.decode(tokens[i].tolist(), skip_special_tokens=True) for i in range(num_sequences)]
 
 
 def compute_loss_components(
@@ -806,6 +859,21 @@ def main():
                     f"(MSE {avg_val_mse:.4f}, CE {avg_val_ce:.4f}, VelMSE {avg_val_velocity_mse:.4f}, PPL {val_ce_perplexity:.2f}) | "
                     f"LR: {current_lr:.2e}"
                 )
+
+            if args.sample_interval > 0 and (epoch + 1) % args.sample_interval == 0:
+                samples = generate_samples(
+                    model, tokenizer,
+                    num_sequences=args.diagnostic_samples,
+                    seq_len=min(args.seq_len, 128),  # cap at 128 tokens for readable output
+                    device=device,
+                    integration_steps=args.sample_steps,
+                    temperature=args.diagnostic_temperature,
+                    top_k=args.diagnostic_top_k,
+                )
+                print(f"\n--- Generated samples (epoch {epoch + 1}, {args.sample_steps}-step Heun) ---")
+                for i, text in enumerate(samples):
+                    print(f"[{i+1}] {text}")
+                print("---\n")
 
             if (
                 args.early_stop_patience > 0

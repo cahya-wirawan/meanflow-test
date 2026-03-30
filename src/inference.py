@@ -191,22 +191,22 @@ def generate_text(
                 t = torch.full((num_sequences, 1), t_value, device=device)
                 v_hat = model.predict_velocity(x_t, t)
 
-                if integration_method == "heun":
+                t_next_value = t_value + dt
+                is_last_step = t_next_value >= 1.0 - 1e-6
+
+                if integration_method == "heun" and not is_last_step:
                     # Predictor step (Euler proposal)
                     x_pred = x_t + dt * v_hat
-                    t_next_value = min(t_value + dt, 1.0)
                     t_next = torch.full((num_sequences, 1), t_next_value, device=device)
-
                     # Corrector velocity at predicted next state
                     v_hat_next = model.predict_velocity(x_pred, t_next)
-
                     # Heun update: average current and predicted slopes
                     x_t = x_t + 0.5 * dt * (v_hat + v_hat_next)
-                elif integration_method == "rk4":
+                elif integration_method == "rk4" and not is_last_step:
                     # RK4 update for x' = v(x, t)
                     k1 = v_hat
 
-                    t2_value = min(t_value + 0.5 * dt, 1.0)
+                    t2_value = t_value + 0.5 * dt
                     t2 = torch.full((num_sequences, 1), t2_value, device=device)
                     x2 = x_t + 0.5 * dt * k1
                     k2 = model.predict_velocity(x2, t2)
@@ -214,14 +214,13 @@ def generate_text(
                     x3 = x_t + 0.5 * dt * k2
                     k3 = model.predict_velocity(x3, t2)
 
-                    t4_value = min(t_value + dt, 1.0)
-                    t4 = torch.full((num_sequences, 1), t4_value, device=device)
+                    t4 = torch.full((num_sequences, 1), t_next_value, device=device)
                     x4 = x_t + dt * k3
                     k4 = model.predict_velocity(x4, t4)
 
                     x_t = x_t + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
                 else:
-                    # Euler update
+                    # Euler update (also used as fallback for last step to avoid t=1 singularity)
                     x_t = x_t + dt * v_hat
 
                 t_value += dt
