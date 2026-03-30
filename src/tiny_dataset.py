@@ -9,10 +9,10 @@ def make_template_dataset(n=5000, seed=42):
     nouns    = ["cats", "books", "pizza", "music", "coffee"]
     adverbs  = ["often", "always", "never", "sometimes", "usually"]
 
+    # One sentence per example so tokenized blocks don't straddle sentence boundaries,
+    # which would cause EOS tokens to appear at position 0 of a block.
     sentences = [
         f"{random.choice(names)} {random.choice(adverbs)} {random.choice(verbs)} {random.choice(nouns)} ."
         for _ in range(n)
     ]
-    # Pack into blocks of ~10 sentences per example
-    examples = [" ".join(sentences[i:i+10]) for i in range(0, len(sentences), 10)]
-    return Dataset.from_dict({"text": examples})
+    return Dataset.from_dict({"text": sentences})
