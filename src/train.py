@@ -307,6 +307,15 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--pad-examples",
+        action="store_true",
+        help=(
+            "Pad each example individually to --seq-len instead of grouping all tokens into blocks. "
+            "Use this when each dataset example is already a complete unit (e.g. one sentence). "
+            "Padding tokens are ignored in the loss."
+        ),
+    )
+    parser.add_argument(
         "--grad-clip-norm",
         type=float,
         default=1.0,
@@ -582,37 +591,63 @@ def main():
     raw_dataset = raw_dataset.filter(lambda x: len(x["text"].strip()) >= args.min_text_chars)
     split_dataset = raw_dataset.train_test_split(test_size=args.val_ratio, seed=args.seed)
 
-    def tokenize_function(examples):
-        # Add EOS separators between samples so grouped text keeps document boundaries.
-        tokenized = tokenizer(examples["text"], add_special_tokens=False)
-        eos_id = tokenizer.eos_token_id
-        tokenized["input_ids"] = [ids + [eos_id] for ids in tokenized["input_ids"]]
-        return tokenized
+    pad_id = tokenizer.pad_token_id
 
-    print("Tokenizing data...")
-    tokenized_datasets = split_dataset.map(
-        tokenize_function,
-        batched=True,
-        remove_columns=["text"],
-        num_proc=args.num_proc,
-    )
+    if args.pad_examples:
+        # Pad-mode: tokenize each example independently and pad/truncate to seq_len.
+        # Use this when each dataset example is already a complete unit (e.g. one sentence).
+        # Padding positions are excluded from the loss via pad_token_id masking.
+        def tokenize_function(examples):
+            tokenized = tokenizer(
+                examples["text"],
+                add_special_tokens=False,
+                max_length=args.seq_len,
+                truncation=True,
+                padding="max_length",
+            )
+            return tokenized
 
-    def group_texts(examples):
-        concatenated_examples = {k: sum(examples[k], []) for k in examples.keys()}
-        total_length = len(concatenated_examples[list(examples.keys())[0]])
-        total_length = (total_length // args.seq_len) * args.seq_len
-        result = {
-            k: [t[i : i + args.seq_len] for i in range(0, total_length, args.seq_len)]
-            for k, t in concatenated_examples.items()
-        }
-        return result
+        print("Tokenizing data (pad-to-seq-len mode)...")
+        lm_datasets = split_dataset.map(
+            tokenize_function,
+            batched=True,
+            remove_columns=["text"],
+            num_proc=args.num_proc,
+        )
+        effective_pad_token_id = pad_id
+    else:
+        # Group-mode: concatenate all tokens and split into fixed-length blocks (no padding).
+        def tokenize_function(examples):
+            tokenized = tokenizer(examples["text"], add_special_tokens=False)
+            eos_id = tokenizer.eos_token_id
+            tokenized["input_ids"] = [ids + [eos_id] for ids in tokenized["input_ids"]]
+            return tokenized
 
-    print("Grouping text into blocks...")
-    lm_datasets = tokenized_datasets.map(
-        group_texts,
-        batched=True,
-        num_proc=args.num_proc,
-    )
+        print("Tokenizing data...")
+        tokenized_datasets = split_dataset.map(
+            tokenize_function,
+            batched=True,
+            remove_columns=["text"],
+            num_proc=args.num_proc,
+        )
+
+        def group_texts(examples):
+            concatenated_examples = {k: sum(examples[k], []) for k in examples.keys()}
+            total_length = len(concatenated_examples[list(examples.keys())[0]])
+            total_length = (total_length // args.seq_len) * args.seq_len
+            result = {
+                k: [t[i : i + args.seq_len] for i in range(0, total_length, args.seq_len)]
+                for k, t in concatenated_examples.items()
+            }
+            return result
+
+        print("Grouping text into blocks...")
+        lm_datasets = tokenized_datasets.map(
+            group_texts,
+            batched=True,
+            num_proc=args.num_proc,
+        )
+        effective_pad_token_id = None
 
     lm_datasets.set_format(type="torch", columns=["input_ids"])
     train_dataset: Any = lm_datasets["train"]
@@ -647,6 +682,8 @@ def main():
         val_dataset = val_dataset.map(remap_ids)
         lm_datasets.set_format(type="torch", columns=["input_ids"])
         effective_vocab_size = restricted_vocab_size
+        if effective_pad_token_id is not None:
+            effective_pad_token_id = orig_to_local.get(effective_pad_token_id, None)
     else:
         effective_vocab_size = len(tokenizer)
         local_to_orig = None
@@ -754,7 +791,7 @@ def main():
                 loss, mse_loss, ce_loss, velocity_mse = compute_loss_components(
                     model,
                     input_ids,
-                    pad_token_id=None,
+                    pad_token_id=effective_pad_token_id,
                     ce_weight=ce_weight,
                     t_sample_power=args.t_sample_power,
                     t_zero_prob=args.t_zero_prob,
@@ -804,7 +841,7 @@ def main():
                     val_loss, val_mse, val_ce, val_velocity_mse = compute_loss_components(
                         model,
                         input_ids,
-                        pad_token_id=None,
+                        pad_token_id=effective_pad_token_id,
                         ce_weight=ce_weight,
                         t_sample_power=args.t_sample_power,
                         t_zero_prob=0.0,
@@ -843,6 +880,9 @@ def main():
                             "max_seq_len": args.seq_len,
                             "prediction_target": args.prediction_target,
                         },
+                        # local_to_orig maps contiguous local indices → original GPT-2 token IDs.
+                        # None when vocabulary was not restricted (full tokenizer vocab used).
+                        "local_to_orig": local_to_orig,
                     },
                     args.model_path,
                 )

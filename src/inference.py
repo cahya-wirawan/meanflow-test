@@ -167,6 +167,7 @@ def generate_text(
     top_k=50,
     integration_steps=1,
     integration_method="euler",
+    local_to_orig=None,
 ):
     print("\n--- Generating New Text ---")
     model.eval() # Set the model to evaluation mode (turns off dropout, etc.)
@@ -253,15 +254,13 @@ def generate_text(
                     )
                     predicted_token_ids = sampled.view(num_sequences, seq_len)
 
-        # Decode the token IDs back into readable English strings
+        # Remap local indices → original GPT-2 token IDs if vocab was restricted during training.
+        if local_to_orig is not None:
+            predicted_token_ids = local_to_orig[predicted_token_ids.cpu()]
+
         for i in range(num_sequences):
-            # Extract the raw IDs for this specific sequence
             token_ids = predicted_token_ids[i].tolist()
-            
-            # Use the Hugging Face tokenizer to convert IDs to text
-            # skip_special_tokens=True removes the padding tokens we added
             generated_text = tokenizer.decode(token_ids, skip_special_tokens=True)
-            
             print(f"Sequence {i+1}: {generated_text}")
 
 if __name__ == "__main__":
@@ -304,26 +303,30 @@ if __name__ == "__main__":
     # Support both old (state_dict only) and new (dict with config) checkpoint formats.
     if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
         cfg = checkpoint["model_config"]
+        local_to_orig = checkpoint.get("local_to_orig", None)  # None = full vocab, no remapping
         print(
             f"Loaded checkpoint config: d_model={cfg['d_model']} num_heads={cfg['num_heads']} "
             f"num_layers={cfg['num_layers']} max_seq_len={cfg['max_seq_len']} "
-            f"prediction_target={cfg['prediction_target']}"
+            f"prediction_target={cfg['prediction_target']} vocab_size={cfg['vocab_size']}"
+            + (f" (restricted from {vocab_size})" if local_to_orig is not None else "")
         )
-        # CLI args override checkpoint config if explicitly provided, otherwise use checkpoint values.
-        d_model = args.d_model if args.d_model != 128 else cfg["d_model"]
-        num_heads = args.num_heads if args.num_heads != 4 else cfg["num_heads"]
-        num_layers = args.num_layers if args.num_layers != 4 else cfg["num_layers"]
-        max_seq_len = args.seq_len if args.seq_len != SEQ_LEN else cfg["max_seq_len"]
+        d_model = cfg["d_model"]
+        num_heads = cfg["num_heads"]
+        num_layers = cfg["num_layers"]
+        max_seq_len = cfg["max_seq_len"]
         prediction_target = cfg["prediction_target"]
+        effective_vocab_size = cfg["vocab_size"]
         state_dict = checkpoint["model_state_dict"]
     else:
         d_model, num_heads, num_layers = args.d_model, args.num_heads, args.num_layers
         max_seq_len = args.seq_len
         prediction_target = args.prediction_target
+        effective_vocab_size = vocab_size
+        local_to_orig = None
         state_dict = checkpoint
 
     model = MeanFlowLanguageModel(
-        vocab_size=vocab_size,
+        vocab_size=effective_vocab_size,
         d_model=d_model,
         num_heads=num_heads,
         num_layers=num_layers,
@@ -344,4 +347,5 @@ if __name__ == "__main__":
         top_k=args.top_k,
         integration_steps=args.integration_steps,
         integration_method=args.integration_method,
+        local_to_orig=local_to_orig,
     )
