@@ -1,5 +1,7 @@
 # MeanFlow Language Model
 
+*This is a Working in Progress (WIP) project, it is in very early state*
+
 MeanFlow is an experimental language model architecture that treats text generation as a continuous flow problem. Unlike traditional autoregressive models (like GPT) that generate text token-by-token, MeanFlow is designed to generate entire blocks of text simultaneously in a **single "1-step jump"** from pure Gaussian noise.
 
 ## Core Concepts
