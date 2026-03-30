@@ -464,15 +464,15 @@ def compute_loss_components(
         pred_x1 = x_t + (1 - t_expanded) * pred_v
         x1_diff = (pred_x1 - x_1) * mask_expanded
         mse_loss = (x1_diff**2).sum() / (mask.sum() * model.d_model + 1e-6)
+        vel_diff = (pred_v - target_v) * mask_expanded
+        velocity_mse = (vel_diff**2).sum() / (mask.sum() * model.d_model + 1e-6)
+        flow_loss = mse_loss + velocity_loss_weight * velocity_mse
     else:
         pred_x1 = model.forward_net(x_t, t)
         diff = (pred_x1 - x_1) * mask_expanded
         mse_loss = (diff**2).sum() / (mask.sum() * model.d_model + 1e-6)
-        target_v = x_1 - x_0
-        pred_v = model.predict_velocity(x_t, t)
-
-    vel_diff = (pred_v - target_v) * mask_expanded
-    velocity_mse = (vel_diff**2).sum() / (mask.sum() * model.d_model + 1e-6)
+        velocity_mse = torch.tensor(0.0, device=x_1.device)
+        flow_loss = mse_loss
 
     logits = model.lm_logits(pred_x1)
     if pad_token_id is None:
@@ -486,11 +486,6 @@ def compute_loss_components(
             input_ids.view(-1),
             ignore_index=pad_token_id,
         )
-
-    if getattr(model, "prediction_target", "x1") == "v":
-        flow_loss = mse_loss + velocity_loss_weight * velocity_mse
-    else:
-        flow_loss = mse_loss
 
     total_loss = flow_loss + ce_weight * ce_loss
     return total_loss, mse_loss, ce_loss, velocity_mse
@@ -739,13 +734,15 @@ def main():
             val_ce_perplexity = math.exp(avg_val_ce)
 
             if scheduler is not None:
-                scheduler.step(avg_val_ce)
+                # Step on MSE: CE at t=0 saturates early (hard task), causing plateau
+                # scheduler to kill LR prematurely. MSE keeps a more stable signal.
+                scheduler.step(avg_val_mse)
 
             current_lr = optimizer.param_groups[0]["lr"]
 
-            improved = avg_val_ce < (best_val_loss - args.early_stop_min_delta)
+            improved = avg_val_mse < (best_val_loss - args.early_stop_min_delta)
             if improved:
-                best_val_loss = avg_val_ce
+                best_val_loss = avg_val_mse
                 torch.save(model.state_dict(), args.model_path)
                 epochs_without_improvement = 0
             else:

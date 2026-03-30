@@ -4,7 +4,6 @@ import argparse
 SEQ_LEN = 128
 MODEL_PATH = "src/meanflow_language_model.pth"
 
-print(f"Inference time with SEQ_LEN={SEQ_LEN}...")
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -297,7 +296,7 @@ if __name__ == "__main__":
     ).to(device)
 
     # Load the trained model weights (if you have them saved)
-    model.load_state_dict(torch.load(args.model_path, map_location=device))
+    model.load_state_dict(torch.load(args.model_path, map_location=device, weights_only=True))
 
     generate_text(
         model,
