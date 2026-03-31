@@ -140,63 +140,6 @@ class MeanFlowLanguageModel(nn.Module):
         pred_x1 = self._target_to_x1(pred_target, x_t, t)
         return pred_x1
 
-    def compute_loss(self, input_ids, pad_token_id=None, ce_weight=0.5, t_sample_power=1.0):
-        """
-        The training objective: teaches the model the Mean Flow trajectory.
-        Includes masking to ignore padding tokens.
-        """
-        batch_size, seq_len = input_ids.shape
-        
-        # Step A: Map discrete text to the target continuous state (x_1)
-        x_1 = self.embedding(input_ids) 
-        
-        # Step B: Sample the starting pure noise state (x_0)
-        x_0 = torch.randn_like(x_1) 
-        
-        # Step C: Pick a random time t between 0 and 1.
-        # Using t_sample_power > 1 biases sampling toward t ~ 0,
-        # which better matches 1-step inference conditions.
-        if t_sample_power <= 0:
-            raise ValueError("t_sample_power must be > 0")
-        t = torch.rand(batch_size, 1, device=x_1.device).pow(t_sample_power)
-        t_expanded = t.unsqueeze(-1) # Match dimensions [batch, 1, 1]
-        
-        # Step D: Construct the straight flow path (Linear Interpolation)
-        x_t = t_expanded * x_1 + (1 - t_expanded) * x_0
-        
-        # Step E: Predict the target
-        pred_x1 = self.forward_net(x_t, t)
-        
-        # --- Masking Logic ---
-        # If pad_token_id is not provided, train on all tokens.
-        if pad_token_id is None:
-            mask = torch.ones_like(input_ids, dtype=torch.float)
-        else:
-            mask = (input_ids != pad_token_id).float()
-        mask_expanded = mask.unsqueeze(-1) # [batch, seq_len, 1]
-        
-        # Step F: The Mean Flow Continuous Loss (Mean Squared Error)
-        # We manually compute the masked MSE
-        diff = (pred_x1 - x_1) * mask_expanded
-        mse_loss = (diff**2).sum() / (mask.sum() * self.d_model + 1e-6)
-        
-        # Step G: Auxiliary Classification Loss
-        logits = self.lm_logits(pred_x1)
-        if pad_token_id is None:
-            ce_loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                input_ids.view(-1),
-            )
-        else:
-            ce_loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                input_ids.view(-1),
-                ignore_index=pad_token_id,
-            )
-        
-        # Combine the losses with configurable CE weighting.
-        return mse_loss + ce_weight * ce_loss
-
     @torch.no_grad()
     def generate_1_step(
         self,
