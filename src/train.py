@@ -7,6 +7,7 @@ import random
 from typing import Any
 import argparse
 import math
+from pathlib import Path
 from tiny_dataset import make_template_dataset, snli_dataset
 
 SEQ_LEN = 128
@@ -327,12 +328,19 @@ def parse_args():
     parser.add_argument(
         "--lr-scheduler",
         type=str,
-        choices=["none", "plateau"],
+        choices=["none", "plateau", "cosine"],
         default="plateau",
         help=(
             "Learning-rate scheduler strategy. "
-            "plateau uses validation loss to reduce LR when progress stalls."
+            "plateau reduces LR when val MSE stalls. "
+            "cosine anneals LR from learning-rate to lr-min over all epochs."
         ),
+    )
+    parser.add_argument(
+        "--lr-min",
+        type=float,
+        default=1e-6,
+        help="Minimum LR for cosine annealing scheduler.",
     )
     parser.add_argument(
         "--lr-patience",
@@ -350,6 +358,42 @@ def parse_args():
         help=(
             "Multiplicative LR decay factor for plateau scheduler. "
             "New LR = old LR * factor."
+        ),
+    )
+    parser.add_argument(
+        "--checkpoint-dir",
+        type=str,
+        default="checkpoints",
+        help=(
+            "Directory to store periodic checkpoints. "
+            "Created automatically if it does not exist."
+        ),
+    )
+    parser.add_argument(
+        "--checkpoint-interval",
+        type=int,
+        default=0,
+        help=(
+            "Save a periodic checkpoint every N epochs. "
+            "Set to 0 to disable. Checkpoints include optimizer and scheduler state for resuming."
+        ),
+    )
+    parser.add_argument(
+        "--checkpoint-max-keep",
+        type=int,
+        default=3,
+        help=(
+            "Maximum number of periodic checkpoints to keep. "
+            "Oldest checkpoint is deleted when the limit is exceeded."
+        ),
+    )
+    parser.add_argument(
+        "--resume-from",
+        type=str,
+        default=None,
+        help=(
+            "Path to a periodic checkpoint to resume training from. "
+            "Restores model weights, optimizer, scheduler, epoch counter, and best val loss."
         ),
     )
     parser.add_argument(
@@ -564,6 +608,35 @@ def compute_loss_components(
     total_loss = flow_loss + ce_weight * ce_loss
     return total_loss, mse_loss, ce_loss, velocity_mse
 
+def save_periodic_checkpoint(checkpoint_dir, model_path, epoch, model, optimizer, scheduler,
+                              best_val_loss, epochs_without_improvement, model_config,
+                              local_to_orig, checkpoint_paths, max_keep):
+    """Save a resumable checkpoint into checkpoint_dir and evict the oldest if over the limit."""
+    checkpoint_dir = Path(checkpoint_dir)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    stem = Path(model_path).stem
+    ckpt_path = checkpoint_dir / f"{stem}_epoch{epoch:05d}.pth"
+    torch.save(
+        {
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
+            "best_val_loss": best_val_loss,
+            "epochs_without_improvement": epochs_without_improvement,
+            "model_config": model_config,
+            "local_to_orig": local_to_orig,
+        },
+        ckpt_path,
+    )
+    checkpoint_paths.append(ckpt_path)
+    if len(checkpoint_paths) > max_keep:
+        oldest = checkpoint_paths.pop(0)
+        if oldest.exists():
+            oldest.unlink()
+    print(f"Periodic checkpoint saved: {ckpt_path} ({len(checkpoint_paths)}/{max_keep} kept)")
+
+
 def main():
     args = parse_args()
     validate_args(args)
@@ -729,8 +802,35 @@ def main():
             factor=args.lr_factor,
             patience=args.lr_patience,
         )
+    elif args.lr_scheduler == "cosine":
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=args.epochs,
+            eta_min=args.lr_min,
+        )
     print("Num parameters:", sum(p.numel() for p in model.parameters()))
     print("Num trainable parameters:", sum(p.numel() for p in model.parameters() if p.requires_grad))
+
+    start_epoch = 0
+    best_val_loss = float("inf")
+    epochs_without_improvement = 0
+    checkpoint_paths: list = []
+
+    if args.resume_from is not None:
+        print(f"Resuming from checkpoint: {args.resume_from}")
+        ckpt = torch.load(args.resume_from, map_location=device, weights_only=True)
+        model.load_state_dict(ckpt["model_state_dict"])
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        if scheduler is not None and ckpt.get("scheduler_state_dict") is not None:
+            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        start_epoch = ckpt["epoch"]
+        best_val_loss = ckpt["best_val_loss"]
+        epochs_without_improvement = ckpt["epochs_without_improvement"]
+        print(
+            f"Resumed from epoch {start_epoch} | "
+            f"best_val_loss={best_val_loss:.4f} | "
+            f"epochs_without_improvement={epochs_without_improvement}"
+        )
 
     if args.wandb:
         wandb_run = wandb.init(
@@ -777,20 +877,28 @@ def main():
         print(f"W&B enabled: project={args.wandb_project} mode={args.wandb_mode}")
 
     print("\nStarting Training...")
-    best_val_loss = float("inf")
     global_step = 0
-    epochs_without_improvement = 0
+
+    model_config = {
+        "vocab_size": effective_vocab_size,
+        "d_model": args.d_model,
+        "num_heads": args.num_heads,
+        "num_layers": args.num_layers,
+        "max_seq_len": args.seq_len,
+        "prediction_target": args.prediction_target,
+    }
 
     try:
-        for epoch in range(args.epochs):
+        for epoch in range(start_epoch, args.epochs):
             model.train()
             total_train_loss = 0.0
             total_train_mse = 0.0
             total_train_ce = 0.0
             total_train_velocity_mse = 0.0
-            if args.epochs == 1:
+            if args.epochs <= 1:
                 epoch_progress = 1.0
             else:
+                # Use absolute epoch index so ce_weight schedule is consistent when resuming.
                 epoch_progress = epoch / (args.epochs - 1)
             ce_weight = args.ce_weight_start + (
                 args.ce_weight_end - args.ce_weight_start
@@ -871,9 +979,11 @@ def main():
             val_ce_perplexity = math.exp(avg_val_ce)
 
             if scheduler is not None:
-                # Step on MSE: CE at t=0 saturates early (hard task), causing plateau
-                # scheduler to kill LR prematurely. MSE keeps a more stable signal.
-                scheduler.step(avg_val_mse)
+                if args.lr_scheduler == "cosine":
+                    scheduler.step()
+                else:
+                    # plateau: step on MSE — CE at t=0 saturates at unigram entropy floor.
+                    scheduler.step(avg_val_mse)
 
             current_lr = optimizer.param_groups[0]["lr"]
 
@@ -883,16 +993,7 @@ def main():
                 torch.save(
                     {
                         "model_state_dict": model.state_dict(),
-                        "model_config": {
-                            "vocab_size": effective_vocab_size,
-                            "d_model": args.d_model,
-                            "num_heads": args.num_heads,
-                            "num_layers": args.num_layers,
-                            "max_seq_len": args.seq_len,
-                            "prediction_target": args.prediction_target,
-                        },
-                        # local_to_orig maps contiguous local indices → original GPT-2 token IDs.
-                        # None when vocabulary was not restricted (full tokenizer vocab used).
+                        "model_config": model_config,
                         "local_to_orig": local_to_orig,
                     },
                     args.model_path,
@@ -900,6 +1001,22 @@ def main():
                 epochs_without_improvement = 0
             else:
                 epochs_without_improvement += 1
+
+            if args.checkpoint_interval > 0 and (epoch + 1) % args.checkpoint_interval == 0:
+                save_periodic_checkpoint(
+                    checkpoint_dir=args.checkpoint_dir,
+                    model_path=args.model_path,
+                    epoch=epoch + 1,
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    best_val_loss=best_val_loss,
+                    epochs_without_improvement=epochs_without_improvement,
+                    model_config=model_config,
+                    local_to_orig=local_to_orig,
+                    checkpoint_paths=checkpoint_paths,
+                    max_keep=args.checkpoint_max_keep,
+                )
 
             if wandb_run is not None:
                 diagnostic_tokens = model.generate_1_step(
