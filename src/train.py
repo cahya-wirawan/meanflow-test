@@ -156,6 +156,20 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--use-vq",
+        action="store_true",
+        help=(
+            "Enable vector quantization: snap pred_x1 to nearest embedding "
+            "vectors during training via straight-through estimator."
+        ),
+    )
+    parser.add_argument(
+        "--vq-commitment-weight",
+        type=float,
+        default=0.25,
+        help="Weight for VQ commitment loss that pushes predictions toward codebook entries.",
+    )
+    parser.add_argument(
         "--t-sample-power",
         type=float,
         default=2.0,
@@ -605,7 +619,10 @@ def compute_loss_components(
             ignore_index=pad_token_id,
         )
 
-    total_loss = flow_loss + ce_weight * ce_loss
+    # Add VQ commitment loss if enabled.
+    vq_loss = getattr(model, "vq_loss", torch.tensor(0.0, device=x_1.device))
+    vq_weight = getattr(model, "vq_commitment_weight", 0.0)
+    total_loss = flow_loss + ce_weight * ce_loss + vq_weight * vq_loss
     return total_loss, mse_loss, ce_loss, velocity_mse
 
 def save_periodic_checkpoint(checkpoint_dir, model_path, epoch, model, optimizer, scheduler,
@@ -793,6 +810,8 @@ def main():
         num_layers=args.num_layers,
         max_seq_len=args.seq_len,
         prediction_target=args.prediction_target,
+        use_vq=args.use_vq,
+        vq_commitment_weight=args.vq_commitment_weight,
     ).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
     scheduler = None
@@ -887,6 +906,8 @@ def main():
         "num_layers": args.num_layers,
         "max_seq_len": args.seq_len,
         "prediction_target": args.prediction_target,
+        "use_vq": args.use_vq,
+        "vq_commitment_weight": args.vq_commitment_weight,
     }
 
     try:

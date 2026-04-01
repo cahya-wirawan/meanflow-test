@@ -320,12 +320,16 @@ if __name__ == "__main__":
         max_seq_len = cfg["max_seq_len"]
         prediction_target = cfg["prediction_target"]
         effective_vocab_size = cfg["vocab_size"]
+        use_vq = cfg.get("use_vq", False)
+        vq_commitment_weight = cfg.get("vq_commitment_weight", 0.25)
         state_dict = checkpoint["model_state_dict"]
     else:
         d_model, num_heads, num_layers = args.d_model, args.num_heads, args.num_layers
         max_seq_len = args.seq_len
         prediction_target = args.prediction_target
         effective_vocab_size = vocab_size
+        use_vq = False
+        vq_commitment_weight = 0.25
         local_to_orig = None
         state_dict = checkpoint
 
@@ -336,6 +340,8 @@ if __name__ == "__main__":
         num_layers=num_layers,
         max_seq_len=max_seq_len,
         prediction_target=prediction_target,
+        use_vq=use_vq,
+        vq_commitment_weight=vq_commitment_weight,
     ).to(device)
 
     model.load_state_dict(state_dict)

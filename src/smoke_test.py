@@ -13,7 +13,7 @@ def pick_device():
     return torch.device("cpu")
 
 
-def smoke_one(prediction_target, device, vocab_size=128, seq_len=16, batch_size=4):
+def smoke_one(prediction_target, device, vocab_size=128, seq_len=16, batch_size=4, use_vq=False):
     model = MeanFlowLanguageModel(
         vocab_size=vocab_size,
         d_model=64,
@@ -21,6 +21,7 @@ def smoke_one(prediction_target, device, vocab_size=128, seq_len=16, batch_size=
         num_layers=2,
         max_seq_len=seq_len,
         prediction_target=prediction_target,
+        use_vq=use_vq,
     ).to(device)
 
     optimizer = optim.AdamW(model.parameters(), lr=1e-4)
@@ -61,6 +62,8 @@ def main():
 
     smoke_one("x1", device)
     smoke_one("v", device)
+    smoke_one("x1", device, use_vq=True)
+    smoke_one("v", device, use_vq=True)
     print("Smoke test passed")
 
 
