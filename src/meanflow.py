@@ -66,7 +66,7 @@ class MeanFlowLanguageModel(nn.Module):
         
         # 2. The Time-Conditioned Transformer Backbone
         self.transformer = nn.ModuleList(
-            [TimeConditionedTransformerBlock(d_model, num_heads) for _ in range(num_layers)]
+            [TimeConditionedTransformerBlock(d_model, num_heads, ff_mult=8) for _ in range(num_layers)]
         )
         self.final_norm = nn.LayerNorm(d_model)
         
