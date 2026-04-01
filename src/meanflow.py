@@ -82,7 +82,11 @@ class MeanFlowLanguageModel(nn.Module):
         )
         
         # 3. Output Head (Predicts the continuous vector)
-        self.output_head = nn.Linear(d_model, d_model)
+        self.output_head = nn.Sequential(
+            nn.Linear(d_model, d_model * 2),
+            nn.GELU(),
+            nn.Linear(d_model * 2, d_model),
+        )
         
         # 4. The "Rounding" Head (Maps continuous vector back to text probabilities)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
