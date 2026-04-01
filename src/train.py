@@ -629,7 +629,7 @@ def compute_loss_components(
     # Add VQ commitment loss if enabled.
     vq_loss = getattr(model, "vq_loss", torch.tensor(0.0, device=x_1.device))
     total_loss = flow_loss + ce_weight * ce_loss + vq_weight * vq_loss
-    return total_loss, mse_loss, ce_loss, velocity_mse
+    return total_loss, mse_loss, ce_loss, velocity_mse, vq_loss
 
 def save_periodic_checkpoint(checkpoint_dir, model_path, epoch, model, optimizer, scheduler,
                               best_val_loss, epochs_without_improvement, model_config,
@@ -923,6 +923,7 @@ def main():
             total_train_mse = 0.0
             total_train_ce = 0.0
             total_train_velocity_mse = 0.0
+            total_train_vq = 0.0
             if args.epochs <= 1:
                 epoch_progress = 1.0
             else:
@@ -938,7 +939,7 @@ def main():
             for batch in train_dataloader:
                 input_ids = batch["input_ids"].to(device)
                 optimizer.zero_grad()
-                loss, mse_loss, ce_loss, velocity_mse = compute_loss_components(
+                loss, mse_loss, ce_loss, velocity_mse, vq_loss = compute_loss_components(
                     model,
                     input_ids,
                     pad_token_id=effective_pad_token_id,
@@ -958,6 +959,7 @@ def main():
                 total_train_mse += mse_loss.item()
                 total_train_ce += ce_loss.item()
                 total_train_velocity_mse += velocity_mse.item()
+                total_train_vq += vq_loss.item()
 
                 if (
                     wandb_run is not None
@@ -970,6 +972,7 @@ def main():
                             "batch_mse_loss": mse_loss.item(),
                             "batch_ce_loss": ce_loss.item(),
                             "batch_velocity_mse": velocity_mse.item(),
+                            "batch_vq_loss": vq_loss.item(),
                             "epoch": epoch + 1,
                             "global_step": global_step,
                         },
@@ -980,16 +983,18 @@ def main():
             avg_train_mse = total_train_mse / len(train_dataloader)
             avg_train_ce = total_train_ce / len(train_dataloader)
             avg_train_velocity_mse = total_train_velocity_mse / len(train_dataloader)
+            avg_train_vq = total_train_vq / len(train_dataloader)
 
             model.eval()
             total_val_loss = 0.0
             total_val_mse = 0.0
             total_val_ce = 0.0
             total_val_velocity_mse = 0.0
+            total_val_vq = 0.0
             with torch.no_grad():
                 for batch in val_dataloader:
                     input_ids = batch["input_ids"].to(device)
-                    val_loss, val_mse, val_ce, val_velocity_mse = compute_loss_components(
+                    val_loss, val_mse, val_ce, val_velocity_mse, val_vq_loss = compute_loss_components(
                         model,
                         input_ids,
                         pad_token_id=effective_pad_token_id,
@@ -1004,11 +1009,13 @@ def main():
                     total_val_mse += val_mse.item()
                     total_val_ce += val_ce.item()
                     total_val_velocity_mse += val_velocity_mse.item()
+                    total_val_vq += val_vq_loss.item()
 
             avg_val_loss = total_val_loss / len(val_dataloader)
             avg_val_mse = total_val_mse / len(val_dataloader)
             avg_val_ce = total_val_ce / len(val_dataloader)
             avg_val_velocity_mse = total_val_velocity_mse / len(val_dataloader)
+            avg_val_vq = total_val_vq / len(val_dataloader)
             val_ce_perplexity = math.exp(avg_val_ce)
 
             if scheduler is not None:
@@ -1071,14 +1078,17 @@ def main():
                         "train_mse_loss": avg_train_mse,
                         "train_ce_loss": avg_train_ce,
                         "train_velocity_mse": avg_train_velocity_mse,
+                        "train_vq_loss": avg_train_vq,
                         "val_loss": avg_val_loss,
                         "val_mse_loss": avg_val_mse,
                         "val_ce_loss": avg_val_ce,
                         "val_velocity_mse": avg_val_velocity_mse,
+                        "val_vq_loss": avg_val_vq,
                         "val_ce_perplexity": val_ce_perplexity,
                         "best_val_loss": best_val_loss,
                         "checkpoint_saved": int(improved),
                         "ce_weight": ce_weight,
+                        "vq_weight": vq_weight,
                         "learning_rate": current_lr,
                         "epochs_without_improvement": epochs_without_improvement,
                         "distinct_1": diversity["distinct_1"],
@@ -1094,9 +1104,9 @@ def main():
                 print(
                     f"Epoch [{epoch + 1}/{args.epochs}] | "
                     f"Train Loss: {avg_train_loss:.4f} "
-                    f"(MSE {avg_train_mse:.4f}, CE {avg_train_ce:.4f}, VelMSE {avg_train_velocity_mse:.4f}) | "
+                    f"(MSE {avg_train_mse:.4f}, CE {avg_train_ce:.4f}, VelMSE {avg_train_velocity_mse:.4f}, VQ {avg_train_vq:.4f}) | "
                     f"Val Loss: {avg_val_loss:.4f} "
-                    f"(MSE {avg_val_mse:.4f}, CE {avg_val_ce:.4f}, VelMSE {avg_val_velocity_mse:.4f}, PPL {val_ce_perplexity:.2f}) | "
+                    f"(MSE {avg_val_mse:.4f}, CE {avg_val_ce:.4f}, VelMSE {avg_val_velocity_mse:.4f}, VQ {avg_val_vq:.4f}, PPL {val_ce_perplexity:.2f}) | "
                     f"LR: {current_lr:.2e}"
                 )
 
