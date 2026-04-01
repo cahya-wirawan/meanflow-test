@@ -25,3 +25,11 @@ def snli_dataset(split="train[:100%]", max_words=12):
     raw_dataset = raw_dataset.rename_column("hypothesis", "text")
     raw_dataset = raw_dataset.remove_columns([c for c in raw_dataset.column_names if c != "text"])
     return raw_dataset
+
+def wiki_dataset(split="train[:100%]", max_words=100, min_words=50):
+    raw_dataset = load_dataset("Salesforce/wikitext", "wikitext-103-raw-v1", split=split)
+    raw_dataset = raw_dataset.filter(
+        lambda x: min_words <= len(x["text"].split()) <= max_words
+    )
+    raw_dataset = raw_dataset.remove_columns([c for c in raw_dataset.column_names if c != "text"])
+    return raw_dataset

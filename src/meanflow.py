@@ -87,7 +87,7 @@ class MeanFlowLanguageModel(nn.Module):
         # 4. The "Rounding" Head (Maps continuous vector back to text probabilities)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
         # Often, we tie the weights of the embedding and LM head for efficiency:
-        self.lm_head.weight = self.embedding.weight 
+        # self.lm_head.weight = self.embedding.weight 
         # Learnable logit temperature for cosine logits; helps avoid exploding CE.
         self.logit_scale = nn.Parameter(torch.tensor(math.log(math.sqrt(d_model))))
 
