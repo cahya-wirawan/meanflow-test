@@ -31,7 +31,9 @@ def smoke_one(prediction_target, device, vocab_size=128, seq_len=16, batch_size=
     model.train()
     optimizer.zero_grad()
     loss, mse_loss, ce_loss, velocity_mse, vq_loss, vq_diag = compute_loss_components(
-        model, input_ids, pad_token_id=None
+        model, input_ids, pad_token_id=None,
+        vq_weight=0.25 if use_vq else 0.0,
+        vq_entropy_weight=0.1 if use_vq else 0.0,
     )
     loss.backward()
     optimizer.step()

@@ -139,12 +139,12 @@ class MeanFlowLanguageModel(nn.Module):
         denom = (1.0 - t.unsqueeze(-1)).clamp_min(eps)
         return (pred_target - x_t) / denom
 
-    def quantize(self, pred_x1, commitment_weight=0.25):
+    def quantize(self, pred_x1, commitment_weight=0.25, entropy_weight=0.0):
         """Vector-quantize pred_x1 against the embedding codebook.
 
         Returns:
             z_q_st: straight-through quantized output (forward=quantized, backward→pred_x1)
-            vq_loss: commitment + codebook loss (scalar)
+            vq_loss: commitment + codebook loss + optional entropy regularization (scalar)
             vq_diagnostics: dict with codebook usage metrics
         """
         codebook = self.embedding.weight  # [vocab_size, d_model]
@@ -167,6 +167,15 @@ class MeanFlowLanguageModel(nn.Module):
         codebook_loss = F.mse_loss(quantized, pred_x1.detach())
         vq_loss = codebook_loss + commitment_weight * commitment_loss
 
+        # Entropy regularization: encourage uniform code usage by maximizing
+        # the entropy of the soft code assignment distribution.
+        if entropy_weight > 0:
+            # Soft assignments via negative distances (temperature=1).
+            soft_probs = F.softmax(-dists, dim=-1)  # [batch*seq_len, vocab_size]
+            avg_soft_probs = soft_probs.mean(dim=0)  # [vocab_size]
+            entropy_reg = (avg_soft_probs * (avg_soft_probs + 1e-10).log()).sum()
+            vq_loss = vq_loss + entropy_weight * entropy_reg
+
         # Straight-through: forward uses quantized, backward flows to pred_x1.
         z_q_st = pred_x1 + (quantized - pred_x1).detach()
 
@@ -188,6 +197,36 @@ class MeanFlowLanguageModel(nn.Module):
         }
 
         return z_q_st, vq_loss, vq_diagnostics
+
+    @torch.no_grad()
+    def reset_dead_codes(self, pred_x1_batch, usage_counts, threshold=1):
+        """Replace underused codebook entries with perturbed encoder outputs.
+
+        Args:
+            pred_x1_batch: recent encoder outputs [N, d_model] to sample replacements from.
+            usage_counts: tensor of shape [vocab_size] with per-code usage counts.
+            threshold: codes with usage <= threshold are considered dead.
+
+        Returns:
+            Number of codes reset.
+        """
+        dead_mask = usage_counts <= threshold
+        num_dead = dead_mask.sum().item()
+        if num_dead == 0 or pred_x1_batch.size(0) == 0:
+            return 0
+
+        # Sample replacement vectors from encoder outputs (with small noise).
+        replace_indices = torch.randint(0, pred_x1_batch.size(0), (num_dead,),
+                                        device=pred_x1_batch.device)
+        replacements = pred_x1_batch[replace_indices]
+        noise = torch.randn_like(replacements) * 0.01
+        replacements = replacements + noise
+
+        # Overwrite dead embedding entries.
+        dead_indices = dead_mask.nonzero(as_tuple=True)[0]
+        self.embedding.weight.data[dead_indices] = replacements
+
+        return num_dead
 
     def forward_net(self, x_t, t):
         """
