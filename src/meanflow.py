@@ -139,12 +139,13 @@ class MeanFlowLanguageModel(nn.Module):
         denom = (1.0 - t.unsqueeze(-1)).clamp_min(eps)
         return (pred_target - x_t) / denom
 
-    def compute_vq_loss(self, pred_x1):
-        """Compute VQ commitment loss between pred_x1 and nearest embedding vectors.
+    def quantize(self, pred_x1, commitment_weight=0.25):
+        """Vector-quantize pred_x1 against the embedding codebook.
 
-        Returns the commitment loss (scalar) without modifying pred_x1.
-        The loss encourages continuous predictions to stay close to codebook entries,
-        bridging the train/inference discretization gap.
+        Returns:
+            z_q_st: straight-through quantized output (forward=quantized, backward→pred_x1)
+            vq_loss: commitment + codebook loss (scalar)
+            vq_diagnostics: dict with codebook usage metrics
         """
         codebook = self.embedding.weight  # [vocab_size, d_model]
         flat = pred_x1.reshape(-1, pred_x1.size(-1))  # [batch*seq_len, d_model]
@@ -159,7 +160,34 @@ class MeanFlowLanguageModel(nn.Module):
         indices = dists.argmin(dim=-1)  # [batch*seq_len]
         quantized = codebook[indices].view_as(pred_x1)  # [batch, seq_len, d_model]
 
-        return F.mse_loss(pred_x1, quantized.detach())
+        # Two-sided VQ loss:
+        #   commitment: push encoder outputs toward codebook entries
+        #   codebook:   push codebook entries toward encoder outputs
+        commitment_loss = F.mse_loss(pred_x1, quantized.detach())
+        codebook_loss = F.mse_loss(quantized, pred_x1.detach())
+        vq_loss = codebook_loss + commitment_weight * commitment_loss
+
+        # Straight-through: forward uses quantized, backward flows to pred_x1.
+        z_q_st = pred_x1 + (quantized - pred_x1).detach()
+
+        # Codebook usage diagnostics.
+        num_codes = codebook.size(0)
+        unique_codes = indices.unique().numel()
+        # Perplexity of code usage distribution (higher = more uniform usage).
+        avg_probs = torch.zeros(num_codes, device=pred_x1.device)
+        avg_probs.scatter_add_(0, indices, torch.ones_like(indices, dtype=torch.float))
+        avg_probs = avg_probs / indices.numel()
+        code_entropy = -(avg_probs * (avg_probs + 1e-10).log()).sum()
+        code_perplexity = code_entropy.exp()
+
+        vq_diagnostics = {
+            "codes_used": unique_codes,
+            "codes_total": num_codes,
+            "code_utilization": unique_codes / num_codes,
+            "code_perplexity": code_perplexity.item(),
+        }
+
+        return z_q_st, vq_loss, vq_diagnostics
 
     def forward_net(self, x_t, t):
         """

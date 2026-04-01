@@ -30,7 +30,7 @@ def smoke_one(prediction_target, device, vocab_size=128, seq_len=16, batch_size=
     # Training step via the same path used by train.py.
     model.train()
     optimizer.zero_grad()
-    loss, mse_loss, ce_loss, velocity_mse, vq_loss = compute_loss_components(
+    loss, mse_loss, ce_loss, velocity_mse, vq_loss, vq_diag = compute_loss_components(
         model, input_ids, pad_token_id=None
     )
     loss.backward()
