@@ -54,6 +54,7 @@ class MeanFlowLanguageModel(nn.Module):
         prediction_target="x1",
         use_vq=False,
         vq_commitment_weight=0.25,
+        vq_num_codes=1024,
     ):
         super().__init__()
         self.d_model = d_model
@@ -63,6 +64,7 @@ class MeanFlowLanguageModel(nn.Module):
         self.prediction_target = prediction_target
         self.use_vq = use_vq
         self.vq_commitment_weight = vq_commitment_weight
+        self.vq_num_codes = vq_num_codes
         
         # 1. The Continuous Bridge (Embedding & Positional Encoding)
         self.embedding = nn.Embedding(vocab_size, d_model)
@@ -98,6 +100,10 @@ class MeanFlowLanguageModel(nn.Module):
         # self.lm_head.weight = self.embedding.weight 
         # Learnable logit temperature for cosine logits; helps avoid exploding CE.
         self.logit_scale = nn.Parameter(torch.tensor(math.log(math.sqrt(d_model))))
+
+        # 5. Optional VQ codebook (separate from embedding table).
+        if use_vq:
+            self.vq_codebook = nn.Embedding(vq_num_codes, d_model)
 
     def lm_logits(self, hidden_states):
         # Cosine-similarity logits with bounded learnable temperature.
@@ -140,14 +146,18 @@ class MeanFlowLanguageModel(nn.Module):
         return (pred_target - x_t) / denom
 
     def quantize(self, pred_x1, commitment_weight=0.25, entropy_weight=0.0):
-        """Vector-quantize pred_x1 against the embedding codebook.
+        """Vector-quantize pred_x1 against the VQ codebook.
+
+        Uses a separate learned codebook (self.vq_codebook) instead of the
+        embedding table, so codebook size can be much smaller than vocab_size
+        and gradients don't conflict with input embeddings.
 
         Returns:
             z_q_st: straight-through quantized output (forward=quantized, backward→pred_x1)
             vq_loss: commitment + codebook loss + optional entropy regularization (scalar)
             vq_diagnostics: dict with codebook usage metrics
         """
-        codebook = self.embedding.weight  # [vocab_size, d_model]
+        codebook = self.vq_codebook.weight  # [vq_num_codes, d_model]
         flat = pred_x1.reshape(-1, pred_x1.size(-1))  # [batch*seq_len, d_model]
 
         # Find nearest codebook entry per position (L2 distance).
@@ -156,7 +166,7 @@ class MeanFlowLanguageModel(nn.Module):
             flat.pow(2).sum(dim=-1, keepdim=True)
             + codebook.pow(2).sum(dim=-1).unsqueeze(0)
             - 2.0 * flat @ codebook.t()
-        )  # [batch*seq_len, vocab_size]
+        )  # [batch*seq_len, vq_num_codes]
         indices = dists.argmin(dim=-1)  # [batch*seq_len]
         quantized = codebook[indices].view_as(pred_x1)  # [batch, seq_len, d_model]
 
@@ -170,9 +180,8 @@ class MeanFlowLanguageModel(nn.Module):
         # Entropy regularization: encourage uniform code usage by maximizing
         # the entropy of the soft code assignment distribution.
         if entropy_weight > 0:
-            # Soft assignments via negative distances (temperature=1).
-            soft_probs = F.softmax(-dists, dim=-1)  # [batch*seq_len, vocab_size]
-            avg_soft_probs = soft_probs.mean(dim=0)  # [vocab_size]
+            soft_probs = F.softmax(-dists, dim=-1)  # [batch*seq_len, vq_num_codes]
+            avg_soft_probs = soft_probs.mean(dim=0)  # [vq_num_codes]
             entropy_reg = (avg_soft_probs * (avg_soft_probs + 1e-10).log()).sum()
             vq_loss = vq_loss + entropy_weight * entropy_reg
 
@@ -182,7 +191,6 @@ class MeanFlowLanguageModel(nn.Module):
         # Codebook usage diagnostics.
         num_codes = codebook.size(0)
         unique_codes = indices.unique().numel()
-        # Perplexity of code usage distribution (higher = more uniform usage).
         avg_probs = torch.zeros(num_codes, device=pred_x1.device)
         avg_probs.scatter_add_(0, indices, torch.ones_like(indices, dtype=torch.float))
         avg_probs = avg_probs / indices.numel()
@@ -200,11 +208,11 @@ class MeanFlowLanguageModel(nn.Module):
 
     @torch.no_grad()
     def reset_dead_codes(self, pred_x1_batch, usage_counts, threshold=1):
-        """Replace underused codebook entries with perturbed encoder outputs.
+        """Replace underused VQ codebook entries with perturbed encoder outputs.
 
         Args:
             pred_x1_batch: recent encoder outputs [N, d_model] to sample replacements from.
-            usage_counts: tensor of shape [vocab_size] with per-code usage counts.
+            usage_counts: tensor of shape [vq_num_codes] with per-code usage counts.
             threshold: codes with usage <= threshold are considered dead.
 
         Returns:
@@ -215,16 +223,14 @@ class MeanFlowLanguageModel(nn.Module):
         if num_dead == 0 or pred_x1_batch.size(0) == 0:
             return 0
 
-        # Sample replacement vectors from encoder outputs (with small noise).
         replace_indices = torch.randint(0, pred_x1_batch.size(0), (num_dead,),
                                         device=pred_x1_batch.device)
         replacements = pred_x1_batch[replace_indices]
         noise = torch.randn_like(replacements) * 0.01
         replacements = replacements + noise
 
-        # Overwrite dead embedding entries.
         dead_indices = dead_mask.nonzero(as_tuple=True)[0]
-        self.embedding.weight.data[dead_indices] = replacements
+        self.vq_codebook.weight.data[dead_indices] = replacements
 
         return num_dead
 

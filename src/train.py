@@ -194,6 +194,15 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--vq-num-codes",
+        type=int,
+        default=1024,
+        help=(
+            "Number of entries in the VQ codebook. Typical range: 256-4096. "
+            "Smaller codebooks are easier to utilize fully; larger ones offer more expressiveness."
+        ),
+    )
+    parser.add_argument(
         "--t-sample-power",
         type=float,
         default=2.0,
@@ -849,6 +858,7 @@ def main():
         prediction_target=args.prediction_target,
         use_vq=args.use_vq,
         vq_commitment_weight=args.vq_commitment_weight,
+        vq_num_codes=args.vq_num_codes,
     ).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
     scheduler = None
@@ -945,6 +955,7 @@ def main():
         "prediction_target": args.prediction_target,
         "use_vq": args.use_vq,
         "vq_commitment_weight": args.vq_commitment_weight,
+        "vq_num_codes": args.vq_num_codes,
     }
 
     try:
@@ -1058,21 +1069,17 @@ def main():
             # Codebook reset: replace dead codes with perturbed encoder outputs.
             num_codes_reset = 0
             if args.use_vq and vq_weight > 0:
-                # Gather encoder outputs from a few val batches for replacement vectors.
                 with torch.no_grad():
-                    # Track code usage across all val data.
-                    usage_counts = torch.zeros(model.embedding.weight.size(0), device=device)
+                    usage_counts = torch.zeros(model.vq_num_codes, device=device)
                     encoder_samples = []
-                    max_samples = 4096  # cap memory usage
+                    max_samples = 4096
                     for batch in val_dataloader:
                         input_ids = batch["input_ids"].to(device)
-                        x_1 = model.embedding(input_ids)
-                        x_0 = torch.randn_like(x_1)
+                        x_0 = torch.randn(input_ids.size(0), input_ids.size(1), model.d_model, device=device)
                         t = torch.zeros(input_ids.size(0), 1, device=device)
                         pred_x1 = model.forward_net(x_0, t)
                         flat = pred_x1.reshape(-1, model.d_model)
-                        # Count code usage.
-                        codebook = model.embedding.weight
+                        codebook = model.vq_codebook.weight
                         dists = (
                             flat.pow(2).sum(dim=-1, keepdim=True)
                             + codebook.pow(2).sum(dim=-1).unsqueeze(0)
@@ -1080,7 +1087,6 @@ def main():
                         )
                         indices = dists.argmin(dim=-1)
                         usage_counts.scatter_add_(0, indices, torch.ones_like(indices, dtype=torch.float))
-                        # Collect encoder outputs for replacement.
                         if sum(s.size(0) for s in encoder_samples) < max_samples:
                             encoder_samples.append(flat[:256].clone())
                     if encoder_samples:
@@ -1089,7 +1095,7 @@ def main():
                             all_samples, usage_counts, threshold=args.vq_reset_threshold
                         )
                         if num_codes_reset > 0:
-                            print(f"  VQ codebook reset: {num_codes_reset} dead codes replaced")
+                            print(f"  VQ codebook reset: {num_codes_reset}/{model.vq_num_codes} dead codes replaced")
 
             if scheduler is not None:
                 if args.lr_scheduler == "cosine":
