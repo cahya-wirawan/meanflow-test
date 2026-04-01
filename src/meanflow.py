@@ -63,7 +63,6 @@ class MeanFlowLanguageModel(nn.Module):
         self.prediction_target = prediction_target
         self.use_vq = use_vq
         self.vq_commitment_weight = vq_commitment_weight
-        self.vq_loss = torch.tensor(0.0)  # updated each forward pass when use_vq=True
         
         # 1. The Continuous Bridge (Embedding & Positional Encoding)
         self.embedding = nn.Embedding(vocab_size, d_model)
@@ -140,14 +139,13 @@ class MeanFlowLanguageModel(nn.Module):
         denom = (1.0 - t.unsqueeze(-1)).clamp_min(eps)
         return (pred_target - x_t) / denom
 
-    def _quantize_to_codebook(self, pred_x1):
-        """Snap pred_x1 to nearest embedding vectors (straight-through estimator).
+    def compute_vq_loss(self, pred_x1):
+        """Compute VQ commitment loss between pred_x1 and nearest embedding vectors.
 
-        Uses the embedding matrix as a codebook. Gradients flow through the
-        quantized output via straight-through, and a commitment loss encourages
-        the continuous predictions to stay close to codebook entries.
+        Returns the commitment loss (scalar) without modifying pred_x1.
+        The loss encourages continuous predictions to stay close to codebook entries,
+        bridging the train/inference discretization gap.
         """
-        # pred_x1: [batch, seq_len, d_model]
         codebook = self.embedding.weight  # [vocab_size, d_model]
         flat = pred_x1.reshape(-1, pred_x1.size(-1))  # [batch*seq_len, d_model]
 
@@ -161,11 +159,7 @@ class MeanFlowLanguageModel(nn.Module):
         indices = dists.argmin(dim=-1)  # [batch*seq_len]
         quantized = codebook[indices].view_as(pred_x1)  # [batch, seq_len, d_model]
 
-        # Commitment loss: push pred_x1 toward its nearest codebook entry.
-        self.vq_loss = F.mse_loss(pred_x1, quantized.detach())
-
-        # Straight-through: forward uses quantized, backward flows to pred_x1.
-        return pred_x1 + (quantized - pred_x1).detach()
+        return F.mse_loss(pred_x1, quantized.detach())
 
     def forward_net(self, x_t, t):
         """
@@ -174,8 +168,6 @@ class MeanFlowLanguageModel(nn.Module):
         """
         pred_target = self._forward_target(x_t, t)
         pred_x1 = self._target_to_x1(pred_target, x_t, t)
-        if self.use_vq and self.training:
-            pred_x1 = self._quantize_to_codebook(pred_x1)
         return pred_x1
 
     @torch.no_grad()

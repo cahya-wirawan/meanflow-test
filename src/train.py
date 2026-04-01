@@ -627,7 +627,10 @@ def compute_loss_components(
         )
 
     # Add VQ commitment loss if enabled.
-    vq_loss = getattr(model, "vq_loss", torch.tensor(0.0, device=x_1.device))
+    if vq_weight > 0 and getattr(model, "use_vq", False):
+        vq_loss = model.compute_vq_loss(pred_x1)
+    else:
+        vq_loss = torch.tensor(0.0, device=x_1.device)
     total_loss = flow_loss + ce_weight * ce_loss + vq_weight * vq_loss
     return total_loss, mse_loss, ce_loss, velocity_mse, vq_loss
 
