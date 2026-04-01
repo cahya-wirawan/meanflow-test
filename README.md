@@ -31,8 +31,9 @@ The `MeanFlowLanguageModel` consists of:
 1. **Continuous Bridge**: Maps discrete tokens to a high-dimensional continuous space using learned embeddings and positional encodings.
 2. **Time-Conditioned Transformer**: A Transformer backbone conditioned on the current flow time $t$ via **sinusoidal Fourier time embeddings** (sin/cos features, then projected with SiLU). This gives the model a richer representation of scalar time than a plain linear layer.
 3. **FiLM Conditioning**: Each transformer block applies per-block Feature-wise Linear Modulation (scale + shift) from the time embedding to both the attention and feed-forward sub-layers.
-4. **Prediction Head**: Predicts the target — either $x_1$ directly (`--prediction-target x1`) or the flow velocity $v = x_1 - x_0$ (`--prediction-target v`).
-5. **Rounding Head**: Maps the continuous predictions back to vocabulary logits via cosine-similarity with a learnable temperature, weight-tied with the input embeddings.
+4. **Prediction Head**: A 2-layer MLP (with 2× expansion and GELU) that predicts the target — either $x_1$ directly (`--prediction-target x1`) or the flow velocity $v = x_1 - x_0$ (`--prediction-target v`).
+5. **Rounding Head**: Maps the continuous predictions back to vocabulary logits via cosine-similarity with a learnable temperature.
+6. **Optional Vector Quantization** (`--use-vq`): Snaps predicted $\hat{x}_1$ to the nearest embedding vector using the embedding matrix as a codebook with straight-through gradient estimation. A commitment loss (`--vq-commitment-weight`, default 0.25) pushes continuous predictions closer to codebook entries, reducing the train/inference discretization gap.
 
 ## Getting Started
 
@@ -117,6 +118,7 @@ The training script supports:
 - Explicit $t=0$ alignment with `--t-zero-prob` and `--eval-at-t0`
 - CE weighting schedule with `--ce-weight-start` and `--ce-weight-end`
 - Epoch-level text sampling with `--sample-interval` and `--sample-steps` (prints decoded generated text during training using multi-step Heun integration, so you can monitor generation quality without running inference separately)
+- Optional vector quantization with `--use-vq` and `--vq-commitment-weight`
 - W&B batch metrics via `--wandb-log-interval`
 - Separate MSE/CE logging for train and validation losses
 - Diversity diagnostics in W&B (`distinct_1`, `distinct_2`, entropy)
@@ -212,6 +214,10 @@ python src/smoke_test.py
 	- Try: Install W&B with `pip install wandb`.
 	- For air-gapped runs: use `--wandb --wandb-mode offline`.
 
+- Symptom: VQ commitment loss is too high and MSE stops decreasing.
+	- Try: Lower `--vq-commitment-weight` (e.g., 0.1 instead of 0.25).
+	- Note: Some increase in total loss is expected when VQ is enabled due to the extra commitment term.
+
 - Symptom: Out-of-memory (CUDA/MPS) during training.
 	- Try: Reduce `--batch-size` first.
 	- Try: Reduce `--seq-len` or `--d-model` if memory is still insufficient.
@@ -236,6 +242,7 @@ The model uses a dual-objective loss:
 - **MSE Loss**: Minimizes the distance between the predicted $\hat{x}_1$ and the ground-truth token embeddings. For `--prediction-target v`, this is computed by first converting the predicted velocity back to $\hat{x}_1$.
 - **CE Loss** (auxiliary): Cross-entropy between the cosine-similarity logits of $\hat{x}_1$ and the ground-truth token ids. Weighted by `--ce-weight-start`/`--ce-weight-end` (linearly scheduled over training). Critical for aligning the continuous predictions with the discrete vocabulary.
 - **Velocity MSE** (v-mode only): Additional loss on the predicted velocity $\hat{v}$ vs the true velocity $x_1 - x_0$, weighted by `--velocity-loss-weight`.
+- **VQ Commitment Loss** (optional, `--use-vq`): $\|\hat{x}_1 - \text{quantized}\|^2$ pushes continuous predictions toward their nearest embedding vectors. Weighted by `--vq-commitment-weight` (default 0.25). Bridges the gap between continuous MSE training and discrete argmax inference.
 
 When using grouped fixed-length blocks (the default training path), there is no padding and the loss is computed over all tokens.
 

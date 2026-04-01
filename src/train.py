@@ -167,7 +167,13 @@ def parse_args():
         "--vq-commitment-weight",
         type=float,
         default=0.25,
-        help="Weight for VQ commitment loss that pushes predictions toward codebook entries.",
+        help="Final VQ commitment loss weight (at last epoch). Linearly scheduled from --vq-weight-start.",
+    )
+    parser.add_argument(
+        "--vq-weight-start",
+        type=float,
+        default=0.0,
+        help="Initial VQ commitment loss weight (at first epoch). Ramps linearly to --vq-commitment-weight.",
     )
     parser.add_argument(
         "--t-sample-power",
@@ -563,6 +569,7 @@ def compute_loss_components(
     t_zero_prob=0.0,
     eval_at_t0=False,
     velocity_loss_weight=0.25,
+    vq_weight=0.0,
 ):
     batch_size, _ = input_ids.shape
 
@@ -621,7 +628,6 @@ def compute_loss_components(
 
     # Add VQ commitment loss if enabled.
     vq_loss = getattr(model, "vq_loss", torch.tensor(0.0, device=x_1.device))
-    vq_weight = getattr(model, "vq_commitment_weight", 0.0)
     total_loss = flow_loss + ce_weight * ce_loss + vq_weight * vq_loss
     return total_loss, mse_loss, ce_loss, velocity_mse
 
@@ -925,6 +931,9 @@ def main():
             ce_weight = args.ce_weight_start + (
                 args.ce_weight_end - args.ce_weight_start
             ) * epoch_progress
+            vq_weight = args.vq_weight_start + (
+                args.vq_commitment_weight - args.vq_weight_start
+            ) * epoch_progress
 
             for batch in train_dataloader:
                 input_ids = batch["input_ids"].to(device)
@@ -938,6 +947,7 @@ def main():
                     t_zero_prob=args.t_zero_prob,
                     eval_at_t0=False,
                     velocity_loss_weight=args.velocity_loss_weight,
+                    vq_weight=vq_weight,
                 )
                 loss.backward()
                 if args.grad_clip_norm > 0:
@@ -988,6 +998,7 @@ def main():
                         t_zero_prob=0.0,
                         eval_at_t0=args.eval_at_t0,
                         velocity_loss_weight=args.velocity_loss_weight,
+                        vq_weight=vq_weight,
                     )
                     total_val_loss += val_loss.item()
                     total_val_mse += val_mse.item()
