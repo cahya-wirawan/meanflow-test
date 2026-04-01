@@ -185,24 +185,6 @@ def parse_args():
         ),
     )
     parser.add_argument(
-        "--vq-reset-threshold",
-        type=int,
-        default=1,
-        help=(
-            "Codebook reset threshold. After each epoch, codes used <= this many times "
-            "are replaced with perturbed encoder outputs. Set 0 to only reset completely unused codes."
-        ),
-    )
-    parser.add_argument(
-        "--vq-num-codes",
-        type=int,
-        default=1024,
-        help=(
-            "Number of entries in the VQ codebook. Typical range: 256-4096. "
-            "Smaller codebooks are easier to utilize fully; larger ones offer more expressiveness."
-        ),
-    )
-    parser.add_argument(
         "--t-sample-power",
         type=float,
         default=2.0,
@@ -858,7 +840,6 @@ def main():
         prediction_target=args.prediction_target,
         use_vq=args.use_vq,
         vq_commitment_weight=args.vq_commitment_weight,
-        vq_num_codes=args.vq_num_codes,
     ).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
     scheduler = None
@@ -955,7 +936,6 @@ def main():
         "prediction_target": args.prediction_target,
         "use_vq": args.use_vq,
         "vq_commitment_weight": args.vq_commitment_weight,
-        "vq_num_codes": args.vq_num_codes,
     }
 
     try:
@@ -1066,37 +1046,6 @@ def main():
             avg_val_vq = total_val_vq / len(val_dataloader)
             val_ce_perplexity = math.exp(avg_val_ce)
 
-            # Codebook reset: replace dead codes with perturbed encoder outputs.
-            num_codes_reset = 0
-            if args.use_vq and vq_weight > 0:
-                with torch.no_grad():
-                    usage_counts = torch.zeros(model.vq_num_codes, device=device)
-                    encoder_samples = []
-                    max_samples = 4096
-                    for batch in val_dataloader:
-                        input_ids = batch["input_ids"].to(device)
-                        x_0 = torch.randn(input_ids.size(0), input_ids.size(1), model.d_model, device=device)
-                        t = torch.zeros(input_ids.size(0), 1, device=device)
-                        pred_x1 = model.forward_net(x_0, t)
-                        flat = pred_x1.reshape(-1, model.d_model)
-                        codebook = model.vq_codebook.weight
-                        dists = (
-                            flat.pow(2).sum(dim=-1, keepdim=True)
-                            + codebook.pow(2).sum(dim=-1).unsqueeze(0)
-                            - 2.0 * flat @ codebook.t()
-                        )
-                        indices = dists.argmin(dim=-1)
-                        usage_counts.scatter_add_(0, indices, torch.ones_like(indices, dtype=torch.float))
-                        if sum(s.size(0) for s in encoder_samples) < max_samples:
-                            encoder_samples.append(flat[:256].clone())
-                    if encoder_samples:
-                        all_samples = torch.cat(encoder_samples, dim=0)
-                        num_codes_reset = model.reset_dead_codes(
-                            all_samples, usage_counts, threshold=args.vq_reset_threshold
-                        )
-                        if num_codes_reset > 0:
-                            print(f"  VQ codebook reset: {num_codes_reset}/{model.vq_num_codes} dead codes replaced")
-
             if scheduler is not None:
                 if args.lr_scheduler == "cosine":
                     scheduler.step()
@@ -1179,7 +1128,6 @@ def main():
                     epoch_log["vq_code_utilization"] = last_val_vq_diag["code_utilization"]
                     epoch_log["vq_code_perplexity"] = last_val_vq_diag["code_perplexity"]
                     epoch_log["vq_codes_used"] = last_val_vq_diag["codes_used"]
-                    epoch_log["vq_codes_reset"] = num_codes_reset
                 wandb_run.log(epoch_log, step=global_step)
 
             if (epoch + 1) % 2 == 0 or epoch == 0:
