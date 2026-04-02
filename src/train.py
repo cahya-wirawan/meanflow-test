@@ -413,6 +413,16 @@ def parse_args():
             "Minimum validation-loss decrease required to count as an improvement for early stopping."
         ),
     )
+    parser.add_argument(
+        "--prefix-len",
+        type=int,
+        default=0,
+        help=(
+            "Number of prefix tokens used as conditioning context. "
+            "Each training block is split into prefix (first prefix_len tokens) and target (rest). "
+            "Set to 0 to disable prefix conditioning (unconditional generation)."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -469,6 +479,10 @@ def validate_args(args):
         raise ValueError("--early-stop-patience must be >= 0")
     if args.early_stop_min_delta < 0:
         raise ValueError("--early-stop-min-delta must be >= 0")
+    if args.prefix_len < 0:
+        raise ValueError("--prefix-len must be >= 0")
+    if args.prefix_len >= args.seq_len:
+        raise ValueError("--prefix-len must be less than --seq-len (need at least 1 target token)")
 
 
 def compute_diversity_metrics(tokens, vocab_size):
@@ -498,9 +512,17 @@ def compute_diversity_metrics(tokens, vocab_size):
     }
 
 
-def generate_samples(model, tokenizer, num_sequences, seq_len, device, integration_steps, temperature, top_k, local_to_orig=None):
-    """Generate text via x0-anchored multi-step integration and decode to strings."""
+def generate_samples(model, tokenizer, num_sequences, seq_len, device, integration_steps,
+                     temperature, top_k, local_to_orig=None, prefix_ids=None):
+    """Generate text via x0-anchored multi-step integration and decode to strings.
+
+    Args:
+        prefix_ids: Optional [num_sequences, prefix_len] tensor of token IDs for conditioning.
+    """
     model.eval()
+    prefix_emb = None
+    if prefix_ids is not None:
+        prefix_emb = model.encode_prefix(prefix_ids.to(device))
     with torch.no_grad():
         x_0 = torch.randn(num_sequences, seq_len, model.d_model, device=device)
         x_t = x_0.clone()
@@ -510,9 +532,7 @@ def generate_samples(model, tokenizer, num_sequences, seq_len, device, integrati
         for _ in range(integration_steps):
             t = torch.full((num_sequences, 1), t_val, device=device)
             t_next_val = min(t_val + dt, 1.0)
-            # x0-anchored update: place x_t directly on the line between x_0 and pred_x1.
-            # Avoids the 1/(1-t) singularity that corrupts velocity-based integration.
-            pred_x1 = model.forward_net(x_t, t)
+            pred_x1 = model.forward_net(x_t, t, prefix_emb=prefix_emb)
             x_t = t_next_val * pred_x1 + (1.0 - t_next_val) * x_0
             t_val = t_next_val
 
@@ -530,13 +550,25 @@ def generate_samples(model, tokenizer, num_sequences, seq_len, device, integrati
     # Remap local indices → original GPT-2 token IDs before decoding.
     if local_to_orig is not None:
         tokens = local_to_orig[tokens.cpu()]
+        if prefix_ids is not None:
+            prefix_ids = local_to_orig[prefix_ids.cpu()]
     eos_id = tokenizer.eos_token_id
     results = []
     for i in range(num_sequences):
         token_ids = tokens[i].tolist()
         if eos_id in token_ids:
             token_ids = token_ids[:token_ids.index(eos_id)]
-        results.append(tokenizer.decode(token_ids, skip_special_tokens=True))
+        prefix_text = ""
+        if prefix_ids is not None:
+            prefix_token_ids = prefix_ids[i].tolist()
+            if eos_id in prefix_token_ids:
+                prefix_token_ids = prefix_token_ids[:prefix_token_ids.index(eos_id)]
+            prefix_text = tokenizer.decode(prefix_token_ids, skip_special_tokens=True)
+        generated_text = tokenizer.decode(token_ids, skip_special_tokens=True)
+        if prefix_text:
+            results.append(f"[prefix: {prefix_text}] {generated_text}")
+        else:
+            results.append(generated_text)
     return results
 
 
@@ -549,10 +581,20 @@ def compute_loss_components(
     t_zero_prob=0.0,
     eval_at_t0=False,
     velocity_loss_weight=0.25,
+    prefix_len=0,
 ):
-    batch_size, _ = input_ids.shape
+    batch_size, total_len = input_ids.shape
 
-    x_1 = model.embedding(input_ids)
+    # Split into prefix (clean context) and target (flow prediction).
+    if prefix_len > 0:
+        prefix_ids = input_ids[:, :prefix_len]
+        target_ids = input_ids[:, prefix_len:].contiguous()
+        prefix_emb = model.encode_prefix(prefix_ids)
+    else:
+        target_ids = input_ids
+        prefix_emb = None
+
+    x_1 = model.embedding(target_ids)
     x_0 = torch.randn_like(x_1)
 
     if eval_at_t0:
@@ -566,28 +608,24 @@ def compute_loss_components(
     x_t = t_expanded * x_1 + (1 - t_expanded) * x_0
 
     if pad_token_id is None:
-        mask = torch.ones_like(input_ids, dtype=torch.float)
+        mask = torch.ones_like(target_ids, dtype=torch.float)
     else:
-        mask = (input_ids != pad_token_id).float()
+        mask = (target_ids != pad_token_id).float()
     mask_expanded = mask.unsqueeze(-1)
 
     if getattr(model, "prediction_target", "x1") == "v":
         # For linear bridges x_t = t*x1 + (1-t)*x0, the true velocity is constant: v = x1 - x0.
         target_v = x_1 - x_0
-        pred_v = model.predict_velocity(x_t, t)
+        pred_v = model.predict_velocity(x_t, t, prefix_emb=prefix_emb)
         pred_x1 = x_t + (1 - t_expanded) * pred_v
         x1_diff = pred_x1 - x_1
-        # MSE over ALL positions (including pad): model must learn to predict pad embedding at
-        # pad positions so it outputs EOS at inference instead of random content tokens.
         mse_loss = (x1_diff**2).sum() / (batch_size * x_1.size(1) * model.d_model)
         vel_diff = (pred_v - target_v) * mask_expanded
         velocity_mse = (vel_diff**2).sum() / (mask.sum() * model.d_model + 1e-6)
         flow_loss = mse_loss + velocity_loss_weight * velocity_mse
     else:
-        pred_x1 = model.forward_net(x_t, t)
+        pred_x1 = model.forward_net(x_t, t, prefix_emb=prefix_emb)
         diff = pred_x1 - x_1
-        # MSE over ALL positions (including pad): model must learn to predict pad embedding at
-        # pad positions so it outputs EOS at inference instead of random content tokens.
         mse_loss = (diff**2).sum() / (batch_size * x_1.size(1) * model.d_model)
         velocity_mse = torch.tensor(0.0, device=x_1.device)
         flow_loss = mse_loss
@@ -596,12 +634,12 @@ def compute_loss_components(
     if pad_token_id is None:
         ce_loss = F.cross_entropy(
             logits.view(-1, logits.size(-1)),
-            input_ids.view(-1),
+            target_ids.view(-1),
         )
     else:
         ce_loss = F.cross_entropy(
             logits.view(-1, logits.size(-1)),
-            input_ids.view(-1),
+            target_ids.view(-1),
             ignore_index=pad_token_id,
         )
 
@@ -793,6 +831,7 @@ def main():
         num_layers=args.num_layers,
         max_seq_len=args.seq_len,
         prediction_target=args.prediction_target,
+        prefix_mode=args.prefix_len > 0,
     ).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
     scheduler = None
@@ -870,6 +909,7 @@ def main():
                 "lr_factor": args.lr_factor,
                 "early_stop_patience": args.early_stop_patience,
                 "early_stop_min_delta": args.early_stop_min_delta,
+                "prefix_len": args.prefix_len,
                 "device": str(device),
                 "train_blocks": len(train_dataset),
                 "val_blocks": len(val_dataset),
@@ -887,6 +927,7 @@ def main():
         "num_layers": args.num_layers,
         "max_seq_len": args.seq_len,
         "prediction_target": args.prediction_target,
+        "prefix_len": args.prefix_len,
     }
 
     try:
@@ -917,6 +958,7 @@ def main():
                     t_zero_prob=args.t_zero_prob,
                     eval_at_t0=False,
                     velocity_loss_weight=args.velocity_loss_weight,
+                    prefix_len=args.prefix_len,
                 )
                 loss.backward()
                 if args.grad_clip_norm > 0:
@@ -967,6 +1009,7 @@ def main():
                         t_zero_prob=0.0,
                         eval_at_t0=args.eval_at_t0,
                         velocity_loss_weight=args.velocity_loss_weight,
+                        prefix_len=args.prefix_len,
                     )
                     total_val_loss += val_loss.item()
                     total_val_mse += val_mse.item()
@@ -1020,13 +1063,21 @@ def main():
                 )
 
             if wandb_run is not None:
+                # For prefix-conditioned models, grab prefix tokens from training data.
+                diag_prefix_emb = None
+                if args.prefix_len > 0:
+                    diag_indices = torch.randint(0, len(train_dataset), (args.diagnostic_samples,))
+                    diag_prefix_ids = torch.stack([train_dataset[int(i)]["input_ids"][:args.prefix_len] for i in diag_indices]).to(device)
+                    diag_prefix_emb = model.encode_prefix(diag_prefix_ids)
+                target_len = args.seq_len - args.prefix_len if args.prefix_len > 0 else args.seq_len
                 diagnostic_tokens = model.generate_1_step(
                     batch_size=args.diagnostic_samples,
-                    seq_len=args.seq_len,
+                    seq_len=target_len,
                     device=str(device),
                     sample=True,
                     temperature=args.diagnostic_temperature,
                     top_k=args.diagnostic_top_k,
+                    prefix_emb=diag_prefix_emb,
                 )
                 # Remap local indices back to original token IDs for diversity metrics.
                 if local_to_orig is not None:
@@ -1069,15 +1120,22 @@ def main():
                 )
 
             if args.sample_interval > 0 and (epoch + 1) % args.sample_interval == 0:
+                sample_prefix_ids = None
+                sample_target_len = min(args.seq_len, 128)
+                if args.prefix_len > 0:
+                    sample_indices = torch.randint(0, len(train_dataset), (args.diagnostic_samples,))
+                    sample_prefix_ids = torch.stack([train_dataset[int(i)]["input_ids"][:args.prefix_len] for i in sample_indices])
+                    sample_target_len = min(args.seq_len - args.prefix_len, 128)
                 samples = generate_samples(
                     model, tokenizer,
                     num_sequences=args.diagnostic_samples,
-                    seq_len=min(args.seq_len, 128),  # cap at 128 tokens for readable output
+                    seq_len=sample_target_len,
                     device=device,
                     integration_steps=args.sample_steps,
                     temperature=args.diagnostic_temperature,
                     top_k=args.diagnostic_top_k,
                     local_to_orig=local_to_orig,
+                    prefix_ids=sample_prefix_ids,
                 )
                 print(f"\n--- Generated samples (epoch {epoch + 1}, {args.sample_steps}-step Heun) ---")
                 for i, text in enumerate(samples):

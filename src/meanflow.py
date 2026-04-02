@@ -5,7 +5,7 @@ import math
 
 
 class TimeConditionedTransformerBlock(nn.Module):
-    def __init__(self, d_model, num_heads, ff_mult=4, dropout=0.1):
+    def __init__(self, d_model, num_heads, ff_mult=4, dropout=0.1, use_cross_attention=False):
         super().__init__()
         self.norm1 = nn.LayerNorm(d_model)
         self.attn = nn.MultiheadAttention(
@@ -15,6 +15,19 @@ class TimeConditionedTransformerBlock(nn.Module):
             batch_first=True,
         )
         self.attn_dropout = nn.Dropout(dropout)
+
+        # Cross-attention to prefix context (only when prefix_mode is enabled).
+        self.use_cross_attention = use_cross_attention
+        if use_cross_attention:
+            self.norm_cross = nn.LayerNorm(d_model)
+            self.cross_attn = nn.MultiheadAttention(
+                embed_dim=d_model,
+                num_heads=num_heads,
+                dropout=dropout,
+                batch_first=True,
+            )
+            self.cross_attn_dropout = nn.Dropout(dropout)
+            self.time_to_cross_scale_shift = nn.Linear(d_model, 2 * d_model)
 
         self.norm2 = nn.LayerNorm(d_model)
         self.ff = nn.Sequential(
@@ -32,11 +45,17 @@ class TimeConditionedTransformerBlock(nn.Module):
         scale, shift = proj(t_emb).chunk(2, dim=-1)
         return h * (1.0 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
-    def forward(self, x, t_emb):
+    def forward(self, x, t_emb, context=None):
         h = self.norm1(x)
         h = self._apply_time_film(h, t_emb, self.time_to_attn_scale_shift)
         attn_out, _ = self.attn(h, h, h, need_weights=False)
         x = x + self.attn_dropout(attn_out)
+
+        if self.use_cross_attention and context is not None:
+            h = self.norm_cross(x)
+            h = self._apply_time_film(h, t_emb, self.time_to_cross_scale_shift)
+            cross_out, _ = self.cross_attn(h, context, context, need_weights=False)
+            x = x + self.cross_attn_dropout(cross_out)
 
         h = self.norm2(x)
         h = self._apply_time_film(h, t_emb, self.time_to_ff_scale_shift)
@@ -52,6 +71,7 @@ class MeanFlowLanguageModel(nn.Module):
         num_layers=12,
         max_seq_len=256,
         prediction_target="x1",
+        prefix_mode=False,
     ):
         super().__init__()
         self.d_model = d_model
@@ -59,14 +79,15 @@ class MeanFlowLanguageModel(nn.Module):
         if prediction_target not in {"x1", "v"}:
             raise ValueError("prediction_target must be one of {'x1', 'v'}")
         self.prediction_target = prediction_target
-        
+        self.prefix_mode = prefix_mode
+
         # 1. The Continuous Bridge (Embedding & Positional Encoding)
         self.embedding = nn.Embedding(vocab_size, d_model)
         self.pos_encoding = nn.Parameter(torch.randn(1, max_seq_len, d_model))
-        
+
         # 2. The Time-Conditioned Transformer Backbone
         self.transformer = nn.ModuleList(
-            [TimeConditionedTransformerBlock(d_model, num_heads, ff_mult=8) for _ in range(num_layers)]
+            [TimeConditionedTransformerBlock(d_model, num_heads, ff_mult=8, use_cross_attention=prefix_mode) for _ in range(num_layers)]
         )
         self.final_norm = nn.LayerNorm(d_model)
         
@@ -108,17 +129,32 @@ class MeanFlowLanguageModel(nn.Module):
         fourier = torch.cat([args.sin(), args.cos()], dim=-1)  # [batch, d_model]
         return self.time_embed(fourier)
 
-    def _forward_target(self, x_t, t):
+    def encode_prefix(self, prefix_ids):
+        """Encode prefix token IDs into embeddings with positional encoding.
+
+        The prefix occupies positions [0, prefix_len) in the positional encoding,
+        and target tokens start at position prefix_len.
+        """
+        prefix_emb = self.embedding(prefix_ids)
+        prefix_emb = prefix_emb + self.pos_encoding[:, :prefix_ids.size(1), :]
+        return prefix_emb
+
+    def _forward_target(self, x_t, t, prefix_emb=None):
         t_emb = self._sinusoidal_t_emb(t)  # [batch, d_model]
 
-        if x_t.size(1) > self.max_seq_len:
+        # Target positions are offset by prefix length in the positional encoding.
+        prefix_len = prefix_emb.size(1) if prefix_emb is not None else 0
+        target_len = x_t.size(1)
+        pos_end = prefix_len + target_len
+        if pos_end > self.max_seq_len:
             raise ValueError(
-                f"Input seq_len={x_t.size(1)} exceeds max_seq_len={self.max_seq_len}."
+                f"prefix_len({prefix_len}) + target_len({target_len}) = {pos_end} "
+                f"exceeds max_seq_len={self.max_seq_len}."
             )
 
-        x = x_t + self.pos_encoding[:, :x_t.size(1), :] + t_emb.unsqueeze(1)
+        x = x_t + self.pos_encoding[:, prefix_len:pos_end, :] + t_emb.unsqueeze(1)
         for block in self.transformer:
-            x = block(x, t_emb)
+            x = block(x, t_emb, context=prefix_emb)
         x = self.final_norm(x)
         return self.output_head(x)
 
@@ -128,19 +164,20 @@ class MeanFlowLanguageModel(nn.Module):
         t_expanded = t.unsqueeze(-1)
         return x_t + (1.0 - t_expanded) * pred_target
 
-    def predict_velocity(self, x_t, t, eps=1e-4):
-        pred_target = self._forward_target(x_t, t)
+    def predict_velocity(self, x_t, t, eps=1e-4, prefix_emb=None):
+        pred_target = self._forward_target(x_t, t, prefix_emb=prefix_emb)
         if self.prediction_target == "v":
             return pred_target
         denom = (1.0 - t.unsqueeze(-1)).clamp_min(eps)
         return (pred_target - x_t) / denom
 
-    def forward_net(self, x_t, t):
+    def forward_net(self, x_t, t, prefix_emb=None):
         """
         Takes the noisy latent state x_t and the current time t,
         and predicts the final clean state x_1.
+        Optionally conditions on prefix_emb via cross-attention.
         """
-        pred_target = self._forward_target(x_t, t)
+        pred_target = self._forward_target(x_t, t, prefix_emb=prefix_emb)
         pred_x1 = self._target_to_x1(pred_target, x_t, t)
         return pred_x1
 
@@ -153,18 +190,20 @@ class MeanFlowLanguageModel(nn.Module):
         sample=False,
         temperature=1.0,
         top_k=0,
+        prefix_emb=None,
     ):
         """
         Inference: Generates an entire block of text simultaneously in 1 step.
+        Optionally conditions on prefix_emb via cross-attention.
         """
         # 1. Start with a block of pure Gaussian noise
         x_0 = torch.randn(batch_size, seq_len, self.d_model, device=device)
-        
+
         # 2. We are starting at time t = 0
         t = torch.zeros(batch_size, 1, device=device)
-        
+
         # 3. Predict the final continuous state (The massive 1-step Mean Flow jump)
-        pred_x1 = self.forward_net(x_0, t)
+        pred_x1 = self.forward_net(x_0, t, prefix_emb=prefix_emb)
         
         # 4. Round the continuous state back to discrete text tokens
         logits = self.lm_logits(pred_x1)
