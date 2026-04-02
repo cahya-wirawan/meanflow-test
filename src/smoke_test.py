@@ -13,7 +13,7 @@ def pick_device():
     return torch.device("cpu")
 
 
-def smoke_one(prediction_target, device, vocab_size=128, seq_len=16, batch_size=4, use_vq=False):
+def smoke_one(prediction_target, device, vocab_size=128, seq_len=16, batch_size=4):
     model = MeanFlowLanguageModel(
         vocab_size=vocab_size,
         d_model=64,
@@ -21,7 +21,6 @@ def smoke_one(prediction_target, device, vocab_size=128, seq_len=16, batch_size=
         num_layers=2,
         max_seq_len=seq_len,
         prediction_target=prediction_target,
-        use_vq=use_vq,
     ).to(device)
 
     optimizer = optim.AdamW(model.parameters(), lr=1e-4)
@@ -30,10 +29,8 @@ def smoke_one(prediction_target, device, vocab_size=128, seq_len=16, batch_size=
     # Training step via the same path used by train.py.
     model.train()
     optimizer.zero_grad()
-    loss, mse_loss, ce_loss, velocity_mse, vq_loss, vq_diag = compute_loss_components(
-        model, input_ids, pad_token_id=None,
-        vq_weight=0.25 if use_vq else 0.0,
-        vq_entropy_weight=0.1 if use_vq else 0.0,
+    loss, mse_loss, ce_loss, velocity_mse = compute_loss_components(
+        model, input_ids, pad_token_id=None
     )
     loss.backward()
     optimizer.step()
@@ -49,7 +46,7 @@ def smoke_one(prediction_target, device, vocab_size=128, seq_len=16, batch_size=
     print(
         f"[{prediction_target}] train_loss={loss.item():.4f} "
         f"mse={mse_loss.item():.4f} ce={ce_loss.item():.4f} "
-        f"vel_mse={velocity_mse.item():.4f} vq={vq_loss.item():.4f} "
+        f"vel_mse={velocity_mse.item():.4f} "
         f"generated={tuple(generated.shape)}"
     )
 
@@ -64,8 +61,6 @@ def main():
 
     smoke_one("x1", device)
     smoke_one("v", device)
-    smoke_one("x1", device, use_vq=True)
-    smoke_one("v", device, use_vq=True)
     print("Smoke test passed")
 
 

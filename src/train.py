@@ -156,35 +156,6 @@ def parse_args():
         ),
     )
     parser.add_argument(
-        "--use-vq",
-        action="store_true",
-        help=(
-            "Enable vector quantization: snap pred_x1 to nearest embedding "
-            "vectors during training via straight-through estimator."
-        ),
-    )
-    parser.add_argument(
-        "--vq-commitment-weight",
-        type=float,
-        default=0.25,
-        help="Final VQ commitment loss weight (at last epoch). Linearly scheduled from --vq-weight-start.",
-    )
-    parser.add_argument(
-        "--vq-weight-start",
-        type=float,
-        default=0.0,
-        help="Initial VQ commitment loss weight (at first epoch). Ramps linearly to --vq-commitment-weight.",
-    )
-    parser.add_argument(
-        "--vq-entropy-weight",
-        type=float,
-        default=0.1,
-        help=(
-            "Entropy regularization weight for VQ. Encourages uniform codebook usage "
-            "by maximizing entropy of soft code assignments. Set 0 to disable."
-        ),
-    )
-    parser.add_argument(
         "--t-sample-power",
         type=float,
         default=2.0,
@@ -578,8 +549,6 @@ def compute_loss_components(
     t_zero_prob=0.0,
     eval_at_t0=False,
     velocity_loss_weight=0.25,
-    vq_weight=0.0,
-    vq_entropy_weight=0.0,
 ):
     batch_size, _ = input_ids.shape
 
@@ -623,21 +592,7 @@ def compute_loss_components(
         velocity_mse = torch.tensor(0.0, device=x_1.device)
         flow_loss = mse_loss
 
-    # VQ path: compute CE on straight-through quantized z_q_st so the model
-    # learns to decode from discrete codebook states.  MSE stays on raw pred_x1.
-    vq_loss = torch.tensor(0.0, device=x_1.device)
-    vq_diagnostics = None
-    if vq_weight > 0 and getattr(model, "use_vq", False):
-        z_q_st, vq_loss, vq_diagnostics = model.quantize(
-            pred_x1,
-            commitment_weight=getattr(model, "vq_commitment_weight", 0.25),
-            entropy_weight=vq_entropy_weight,
-        )
-        ce_input = z_q_st
-    else:
-        ce_input = pred_x1
-
-    logits = model.lm_logits(ce_input)
+    logits = model.lm_logits(pred_x1)
     if pad_token_id is None:
         ce_loss = F.cross_entropy(
             logits.view(-1, logits.size(-1)),
@@ -650,8 +605,8 @@ def compute_loss_components(
             ignore_index=pad_token_id,
         )
 
-    total_loss = flow_loss + ce_weight * ce_loss + vq_weight * vq_loss
-    return total_loss, mse_loss, ce_loss, velocity_mse, vq_loss, vq_diagnostics
+    total_loss = flow_loss + ce_weight * ce_loss
+    return total_loss, mse_loss, ce_loss, velocity_mse
 
 def save_periodic_checkpoint(checkpoint_dir, model_path, epoch, model, optimizer, scheduler,
                               best_val_loss, epochs_without_improvement, model_config,
@@ -838,8 +793,6 @@ def main():
         num_layers=args.num_layers,
         max_seq_len=args.seq_len,
         prediction_target=args.prediction_target,
-        use_vq=args.use_vq,
-        vq_commitment_weight=args.vq_commitment_weight,
     ).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
     scheduler = None
@@ -934,8 +887,6 @@ def main():
         "num_layers": args.num_layers,
         "max_seq_len": args.seq_len,
         "prediction_target": args.prediction_target,
-        "use_vq": args.use_vq,
-        "vq_commitment_weight": args.vq_commitment_weight,
     }
 
     try:
@@ -945,7 +896,6 @@ def main():
             total_train_mse = 0.0
             total_train_ce = 0.0
             total_train_velocity_mse = 0.0
-            total_train_vq = 0.0
             if args.epochs <= 1:
                 epoch_progress = 1.0
             else:
@@ -954,14 +904,11 @@ def main():
             ce_weight = args.ce_weight_start + (
                 args.ce_weight_end - args.ce_weight_start
             ) * epoch_progress
-            vq_weight = args.vq_weight_start + (
-                args.vq_commitment_weight - args.vq_weight_start
-            ) * epoch_progress
 
             for batch in train_dataloader:
                 input_ids = batch["input_ids"].to(device)
                 optimizer.zero_grad()
-                loss, mse_loss, ce_loss, velocity_mse, vq_loss, vq_diag = compute_loss_components(
+                loss, mse_loss, ce_loss, velocity_mse = compute_loss_components(
                     model,
                     input_ids,
                     pad_token_id=effective_pad_token_id,
@@ -970,8 +917,6 @@ def main():
                     t_zero_prob=args.t_zero_prob,
                     eval_at_t0=False,
                     velocity_loss_weight=args.velocity_loss_weight,
-                    vq_weight=vq_weight,
-                    vq_entropy_weight=args.vq_entropy_weight,
                 )
                 loss.backward()
                 if args.grad_clip_norm > 0:
@@ -982,44 +927,38 @@ def main():
                 total_train_mse += mse_loss.item()
                 total_train_ce += ce_loss.item()
                 total_train_velocity_mse += velocity_mse.item()
-                total_train_vq += vq_loss.item()
 
                 if (
                     wandb_run is not None
                     and args.wandb_log_interval > 0
                     and global_step % args.wandb_log_interval == 0
                 ):
-                    batch_log = {
-                        "batch_loss": loss.item(),
-                        "batch_mse_loss": mse_loss.item(),
-                        "batch_ce_loss": ce_loss.item(),
-                        "batch_velocity_mse": velocity_mse.item(),
-                        "batch_vq_loss": vq_loss.item(),
-                        "epoch": epoch + 1,
-                        "global_step": global_step,
-                    }
-                    if vq_diag is not None:
-                        batch_log["batch_code_utilization"] = vq_diag["code_utilization"]
-                        batch_log["batch_code_perplexity"] = vq_diag["code_perplexity"]
-                    wandb_run.log(batch_log, step=global_step)
+                    wandb_run.log(
+                        {
+                            "batch_loss": loss.item(),
+                            "batch_mse_loss": mse_loss.item(),
+                            "batch_ce_loss": ce_loss.item(),
+                            "batch_velocity_mse": velocity_mse.item(),
+                            "epoch": epoch + 1,
+                            "global_step": global_step,
+                        },
+                        step=global_step,
+                    )
 
             avg_train_loss = total_train_loss / len(train_dataloader)
             avg_train_mse = total_train_mse / len(train_dataloader)
             avg_train_ce = total_train_ce / len(train_dataloader)
             avg_train_velocity_mse = total_train_velocity_mse / len(train_dataloader)
-            avg_train_vq = total_train_vq / len(train_dataloader)
 
             model.eval()
             total_val_loss = 0.0
             total_val_mse = 0.0
             total_val_ce = 0.0
             total_val_velocity_mse = 0.0
-            total_val_vq = 0.0
-            last_val_vq_diag = None
             with torch.no_grad():
                 for batch in val_dataloader:
                     input_ids = batch["input_ids"].to(device)
-                    val_loss, val_mse, val_ce, val_velocity_mse, val_vq_loss, val_vq_diag = compute_loss_components(
+                    val_loss, val_mse, val_ce, val_velocity_mse = compute_loss_components(
                         model,
                         input_ids,
                         pad_token_id=effective_pad_token_id,
@@ -1028,22 +967,16 @@ def main():
                         t_zero_prob=0.0,
                         eval_at_t0=args.eval_at_t0,
                         velocity_loss_weight=args.velocity_loss_weight,
-                        vq_weight=vq_weight,
-                        vq_entropy_weight=args.vq_entropy_weight,
                     )
                     total_val_loss += val_loss.item()
                     total_val_mse += val_mse.item()
                     total_val_ce += val_ce.item()
                     total_val_velocity_mse += val_velocity_mse.item()
-                    total_val_vq += val_vq_loss.item()
-                    if val_vq_diag is not None:
-                        last_val_vq_diag = val_vq_diag
 
             avg_val_loss = total_val_loss / len(val_dataloader)
             avg_val_mse = total_val_mse / len(val_dataloader)
             avg_val_ce = total_val_ce / len(val_dataloader)
             avg_val_velocity_mse = total_val_velocity_mse / len(val_dataloader)
-            avg_val_vq = total_val_vq / len(val_dataloader)
             val_ce_perplexity = math.exp(avg_val_ce)
 
             if scheduler is not None:
@@ -1099,23 +1032,21 @@ def main():
                 if local_to_orig is not None:
                     diagnostic_tokens = local_to_orig[diagnostic_tokens.cpu()].to(device)
                 diversity = compute_diversity_metrics(diagnostic_tokens, vocab_size=effective_vocab_size)
-                epoch_log = {
+                wandb_run.log(
+                    {
                         "epoch": epoch + 1,
                         "train_loss": avg_train_loss,
                         "train_mse_loss": avg_train_mse,
                         "train_ce_loss": avg_train_ce,
                         "train_velocity_mse": avg_train_velocity_mse,
-                        "train_vq_loss": avg_train_vq,
                         "val_loss": avg_val_loss,
                         "val_mse_loss": avg_val_mse,
                         "val_ce_loss": avg_val_ce,
                         "val_velocity_mse": avg_val_velocity_mse,
-                        "val_vq_loss": avg_val_vq,
                         "val_ce_perplexity": val_ce_perplexity,
                         "best_val_loss": best_val_loss,
                         "checkpoint_saved": int(improved),
                         "ce_weight": ce_weight,
-                        "vq_weight": vq_weight,
                         "learning_rate": current_lr,
                         "epochs_without_improvement": epochs_without_improvement,
                         "distinct_1": diversity["distinct_1"],
@@ -1123,28 +1054,19 @@ def main():
                         "token_entropy": diversity["token_entropy"],
                         "token_entropy_norm": diversity["token_entropy_norm"],
                         "global_step": global_step,
-                    }
-                if last_val_vq_diag is not None:
-                    epoch_log["vq_code_utilization"] = last_val_vq_diag["code_utilization"]
-                    epoch_log["vq_code_perplexity"] = last_val_vq_diag["code_perplexity"]
-                    epoch_log["vq_codes_used"] = last_val_vq_diag["codes_used"]
-                wandb_run.log(epoch_log, step=global_step)
+                    },
+                    step=global_step,
+                )
 
             if (epoch + 1) % 2 == 0 or epoch == 0:
-                log_line = (
+                print(
                     f"Epoch [{epoch + 1}/{args.epochs}] | "
                     f"Train Loss: {avg_train_loss:.4f} "
-                    f"(MSE {avg_train_mse:.4f}, CE {avg_train_ce:.4f}, VelMSE {avg_train_velocity_mse:.4f}, VQ {avg_train_vq:.4f}) | "
+                    f"(MSE {avg_train_mse:.4f}, CE {avg_train_ce:.4f}, VelMSE {avg_train_velocity_mse:.4f}) | "
                     f"Val Loss: {avg_val_loss:.4f} "
-                    f"(MSE {avg_val_mse:.4f}, CE {avg_val_ce:.4f}, VelMSE {avg_val_velocity_mse:.4f}, VQ {avg_val_vq:.4f}, PPL {val_ce_perplexity:.2f}) | "
+                    f"(MSE {avg_val_mse:.4f}, CE {avg_val_ce:.4f}, VelMSE {avg_val_velocity_mse:.4f}, PPL {val_ce_perplexity:.2f}) | "
                     f"LR: {current_lr:.2e}"
                 )
-                if last_val_vq_diag is not None:
-                    log_line += (
-                        f" | VQ codes: {last_val_vq_diag['codes_used']}/{last_val_vq_diag['codes_total']}"
-                        f" ppl={last_val_vq_diag['code_perplexity']:.1f}"
-                    )
-                print(log_line)
 
             if args.sample_interval > 0 and (epoch + 1) % args.sample_interval == 0:
                 samples = generate_samples(

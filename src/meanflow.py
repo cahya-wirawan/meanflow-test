@@ -52,8 +52,6 @@ class MeanFlowLanguageModel(nn.Module):
         num_layers=12,
         max_seq_len=256,
         prediction_target="x1",
-        use_vq=False,
-        vq_commitment_weight=0.25,
     ):
         super().__init__()
         self.d_model = d_model
@@ -61,8 +59,6 @@ class MeanFlowLanguageModel(nn.Module):
         if prediction_target not in {"x1", "v"}:
             raise ValueError("prediction_target must be one of {'x1', 'v'}")
         self.prediction_target = prediction_target
-        self.use_vq = use_vq
-        self.vq_commitment_weight = vq_commitment_weight
         
         # 1. The Continuous Bridge (Embedding & Positional Encoding)
         self.embedding = nn.Embedding(vocab_size, d_model)
@@ -98,7 +94,6 @@ class MeanFlowLanguageModel(nn.Module):
         # self.lm_head.weight = self.embedding.weight 
         # Learnable logit temperature for cosine logits; helps avoid exploding CE.
         self.logit_scale = nn.Parameter(torch.tensor(math.log(math.sqrt(d_model))))
-
 
     def lm_logits(self, hidden_states):
         # Cosine-similarity logits with bounded learnable temperature.
@@ -139,62 +134,6 @@ class MeanFlowLanguageModel(nn.Module):
             return pred_target
         denom = (1.0 - t.unsqueeze(-1)).clamp_min(eps)
         return (pred_target - x_t) / denom
-
-    def quantize(self, pred_x1, commitment_weight=0.25, entropy_weight=0.0):
-        """Vector-quantize pred_x1 against the embedding table using cosine distance.
-
-        Uses cosine distance (not L2) to match lm_logits, which prevents collapse
-        caused by a few high-norm embeddings dominating L2 nearest-neighbor search.
-
-        Returns:
-            z_q_st: straight-through quantized output (forward=quantized, backward→pred_x1)
-            vq_loss: commitment + codebook loss + optional entropy regularization (scalar)
-            vq_diagnostics: dict with codebook usage metrics
-        """
-        codebook = self.embedding.weight  # [vocab_size, d_model]
-        flat = pred_x1.reshape(-1, pred_x1.size(-1))  # [batch*seq_len, d_model]
-
-        # Cosine similarity for nearest-neighbor search (matches lm_logits).
-        flat_norm = F.normalize(flat, dim=-1)
-        codebook_norm = F.normalize(codebook, dim=-1)
-        cos_sim = flat_norm @ codebook_norm.t()  # [batch*seq_len, vocab_size]
-        indices = cos_sim.argmax(dim=-1)  # [batch*seq_len]
-        quantized = codebook[indices].view_as(pred_x1)  # [batch, seq_len, d_model]
-
-        # Two-sided VQ loss:
-        #   commitment: push encoder outputs toward codebook entries
-        #   codebook:   push codebook entries toward encoder outputs
-        commitment_loss = F.mse_loss(pred_x1, quantized.detach())
-        codebook_loss = F.mse_loss(quantized, pred_x1.detach())
-        vq_loss = codebook_loss + commitment_weight * commitment_loss
-
-        # Entropy regularization: encourage uniform code usage by maximizing
-        # the entropy of the soft code assignment distribution.
-        if entropy_weight > 0:
-            avg_soft_probs = F.softmax(cos_sim, dim=-1).mean(dim=0)  # [vocab_size]
-            entropy_reg = (avg_soft_probs * (avg_soft_probs + 1e-10).log()).sum()
-            vq_loss = vq_loss + entropy_weight * entropy_reg
-
-        # Straight-through: forward uses quantized, backward flows to pred_x1.
-        z_q_st = pred_x1 + (quantized - pred_x1).detach()
-
-        # Codebook usage diagnostics.
-        num_codes = codebook.size(0)
-        unique_codes = indices.unique().numel()
-        avg_probs = torch.zeros(num_codes, device=pred_x1.device)
-        avg_probs.scatter_add_(0, indices, torch.ones_like(indices, dtype=torch.float))
-        avg_probs = avg_probs / indices.numel()
-        code_entropy = -(avg_probs * (avg_probs + 1e-10).log()).sum()
-        code_perplexity = code_entropy.exp()
-
-        vq_diagnostics = {
-            "codes_used": unique_codes,
-            "codes_total": num_codes,
-            "code_utilization": unique_codes / num_codes,
-            "code_perplexity": code_perplexity.item(),
-        }
-
-        return z_q_st, vq_loss, vq_diagnostics
 
     def forward_net(self, x_t, t):
         """
