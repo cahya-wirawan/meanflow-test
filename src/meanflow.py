@@ -4,10 +4,26 @@ import torch.nn.functional as F
 import math
 
 
+def _zero_init_linear(in_features, out_features):
+    """Create a linear layer with zero-initialized weight and bias."""
+    lin = nn.Linear(in_features, out_features)
+    nn.init.zeros_(lin.weight)
+    nn.init.zeros_(lin.bias)
+    return lin
+
+
 class TimeConditionedTransformerBlock(nn.Module):
+    """Transformer block with AdaLN-Zero conditioning (DiT-style).
+
+    Each sub-block (self-attn, cross-attn, FF) gets 3 conditioning params from the
+    time embedding: scale, shift, gate.  All conditioning projections are zero-initialized
+    so the block starts as an identity function and smoothly learns to incorporate time.
+    """
+
     def __init__(self, d_model, num_heads, ff_mult=4, dropout=0.1, use_cross_attention=False):
         super().__init__()
-        self.norm1 = nn.LayerNorm(d_model)
+        # Self-attention with AdaLN-Zero: 3 params (scale, shift, gate).
+        self.norm1 = nn.LayerNorm(d_model, elementwise_affine=False)
         self.attn = nn.MultiheadAttention(
             embed_dim=d_model,
             num_heads=num_heads,
@@ -15,11 +31,12 @@ class TimeConditionedTransformerBlock(nn.Module):
             batch_first=True,
         )
         self.attn_dropout = nn.Dropout(dropout)
+        self.adaln_attn = _zero_init_linear(d_model, 3 * d_model)
 
         # Cross-attention to prefix context (only when prefix_mode is enabled).
         self.use_cross_attention = use_cross_attention
         if use_cross_attention:
-            self.norm_cross = nn.LayerNorm(d_model)
+            self.norm_cross = nn.LayerNorm(d_model, elementwise_affine=False)
             self.cross_attn = nn.MultiheadAttention(
                 embed_dim=d_model,
                 num_heads=num_heads,
@@ -27,39 +44,36 @@ class TimeConditionedTransformerBlock(nn.Module):
                 batch_first=True,
             )
             self.cross_attn_dropout = nn.Dropout(dropout)
-            self.time_to_cross_scale_shift = nn.Linear(d_model, 2 * d_model)
+            self.adaln_cross = _zero_init_linear(d_model, 3 * d_model)
 
-        self.norm2 = nn.LayerNorm(d_model)
+        # Feed-forward with AdaLN-Zero: 3 params (scale, shift, gate).
+        self.norm2 = nn.LayerNorm(d_model, elementwise_affine=False)
         self.ff = nn.Sequential(
             nn.Linear(d_model, ff_mult * d_model),
             nn.GELU(),
             nn.Linear(ff_mult * d_model, d_model),
             nn.Dropout(dropout),
         )
-
-        # Per-block FiLM conditioning from time embedding.
-        self.time_to_attn_scale_shift = nn.Linear(d_model, 2 * d_model)
-        self.time_to_ff_scale_shift = nn.Linear(d_model, 2 * d_model)
-
-    def _apply_time_film(self, h, t_emb, proj):
-        scale, shift = proj(t_emb).chunk(2, dim=-1)
-        return h * (1.0 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+        self.adaln_ff = _zero_init_linear(d_model, 3 * d_model)
 
     def forward(self, x, t_emb, context=None):
-        h = self.norm1(x)
-        h = self._apply_time_film(h, t_emb, self.time_to_attn_scale_shift)
+        # Self-attention with gated residual.
+        scale_attn, shift_attn, gate_attn = self.adaln_attn(t_emb).unsqueeze(1).chunk(3, dim=-1)
+        h = self.norm1(x) * (1.0 + scale_attn) + shift_attn
         attn_out, _ = self.attn(h, h, h, need_weights=False)
-        x = x + self.attn_dropout(attn_out)
+        x = x + gate_attn * self.attn_dropout(attn_out)
 
+        # Cross-attention with gated residual (prefix conditioning).
         if self.use_cross_attention and context is not None:
-            h = self.norm_cross(x)
-            h = self._apply_time_film(h, t_emb, self.time_to_cross_scale_shift)
+            scale_cross, shift_cross, gate_cross = self.adaln_cross(t_emb).unsqueeze(1).chunk(3, dim=-1)
+            h = self.norm_cross(x) * (1.0 + scale_cross) + shift_cross
             cross_out, _ = self.cross_attn(h, context, context, need_weights=False)
-            x = x + self.cross_attn_dropout(cross_out)
+            x = x + gate_cross * self.cross_attn_dropout(cross_out)
 
-        h = self.norm2(x)
-        h = self._apply_time_film(h, t_emb, self.time_to_ff_scale_shift)
-        x = x + self.ff(h)
+        # Feed-forward with gated residual.
+        scale_ff, shift_ff, gate_ff = self.adaln_ff(t_emb).unsqueeze(1).chunk(3, dim=-1)
+        h = self.norm2(x) * (1.0 + scale_ff) + shift_ff
+        x = x + gate_ff * self.ff(h)
         return x
 
 class MeanFlowLanguageModel(nn.Module):
@@ -89,8 +103,10 @@ class MeanFlowLanguageModel(nn.Module):
         self.transformer = nn.ModuleList(
             [TimeConditionedTransformerBlock(d_model, num_heads, ff_mult=8, use_cross_attention=prefix_mode) for _ in range(num_layers)]
         )
-        self.final_norm = nn.LayerNorm(d_model)
-        
+        # Final AdaLN-Zero norm before the output head.
+        self.final_norm = nn.LayerNorm(d_model, elementwise_affine=False)
+        self.adaln_final = _zero_init_linear(d_model, 2 * d_model)
+
         # Sinusoidal time embedding: gives the network a rich Fourier basis over [0,1]
         # rather than a single scalar that linear layers struggle to extrapolate from.
         half = d_model // 2
@@ -155,7 +171,9 @@ class MeanFlowLanguageModel(nn.Module):
         x = x_t + self.pos_encoding[:, prefix_len:pos_end, :] + t_emb.unsqueeze(1)
         for block in self.transformer:
             x = block(x, t_emb, context=prefix_emb)
-        x = self.final_norm(x)
+        # Final AdaLN-Zero: scale + shift (no gate needed before the output head).
+        scale_final, shift_final = self.adaln_final(t_emb).unsqueeze(1).chunk(2, dim=-1)
+        x = self.final_norm(x) * (1.0 + scale_final) + shift_final
         return self.output_head(x)
 
     def _target_to_x1(self, pred_target, x_t, t):
